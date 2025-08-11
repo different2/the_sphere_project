@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>COBE Globe - Local Version</title>
+ <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <div class="controls">
+            <div class="control-group">
+                <label>Phi:</label>
+                <input type="range" id="phi" min="0" max="6.28" step="0.01" value="0">
+            </div>
+            <div class="control-group">
+                <label>Theta:</label>
+                <input type="range" id="theta" min="0" max="6.28" step="0.01" value="0">
+            </div>
+            <div class="control-group">
+                <label>Dots:</label>
+                <input type="range" id="dots" min="1000" max="50000" step="1000" value="20000">
+            </div>
+            <div class="control-group">
+                <label>Scale:</label>
+                <input type="range" id="scale" min="0.5" max="2" step="0.1" value="1">
+            </div>
+        </div>
+        <div class="debug" id="debug">Loading...</div>
+        <div class="globe-container">
+            <canvas id="globe"></canvas>
+        </div>
+    </div>
+    <script src="main.js"></script>
+</body>
+</html>
