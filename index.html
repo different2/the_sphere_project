@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Interactive Globe with Custom Textures</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <div class="controls">
+            <div class="control-group">
+                <label>Texture:</label>
+                <select id="textureSelect">
+                    <option value="earth">Earth Map</option>
+                    <option value="smiley">Smiley Face</option>
+                    <option value="text">Text Message</option>
+                    <option value="custom">Upload Image</option>
+                </select>
+            </div>
+            <div class="file-upload">
+                <input type="file" id="fileUpload" accept="image/*" style="display: none;">
+            </div>
+            <div class="control-group">
+                <label>Phi:</label>
+                <input type="range" id="phi" min="0" max="6.28" step="0.01" value="0">
+            </div>
+            <div class="control-group">
+                <label>Theta:</label>
+                <input type="range" id="theta" min="0" max="6.28" step="0.01" value="0">
+            </div>
+            <div class="control-group">
+                <label>Dots:</label>
+                <input type="range" id="dots" min="1000" max="100000" step="1000" value="25000">
+            </div>
+            <div class="control-group">
+                <label>Scale:</label>
+                <input type="range" id="scale" min="0.5" max="1.5" step="0.05" value="1.0">
+            </div>
+        </div>
+        <div class="globe-container">
+            <canvas id="globe"></canvas>
+        </div>
+    </div>
+<script type="module" src="main.js"></script>
+</body>
+</html>
