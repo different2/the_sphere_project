@@ -1,0 +1,84 @@
+    html, body {
+            margin: 0;
+            padding: 0;
+            background: #000;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            font-family: Arial, sans-serif;
+            overflow: hidden;
+        }
+        
+        .container {
+            position: relative;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            width: 100vw;
+            height: 100vh;
+        }
+        
+        .globe-container {
+            position: relative;
+            transition: all 0.1s ease-out;
+        }
+        
+        canvas {
+            width: 100vw;
+            height: 100vh;
+            transition: all 0.1s ease-out;
+        }
+        
+        .controls {
+            position: fixed;
+            top: 50%;
+            right: 20px;
+            transform: translateY(-50%);
+            color: rgb(242, 239, 239);
+            background: rgba(6, 0, 128, 0.9);
+            padding: 20px;
+            border-radius: 12px;
+            font-size: 12px;
+            min-width: 160px;
+            z-index: 100;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+        }
+        
+        .control-group {
+            margin-bottom: 10px;
+        }
+        
+        label {
+            display: inline-block;
+            width: 80px;
+            text-align: left;
+        }
+        
+        input[type="range"] {
+            width: 120px;
+            margin-left: 10px;
+        }
+
+        select {
+            width: 140px;
+            margin-left: 10px;
+            background: rgba(255, 255, 255, 0.1);
+            color: white;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 4px;
+            padding: 2px;
+        }
+
+        .file-upload {
+            margin-top: 10px;
+        }
+
+        input[type="file"] {
+            width: 140px;
+            margin-left: 10px;
+            font-size: 10px;
+            color: white;
+        }
