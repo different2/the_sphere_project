@@ -20,7 +20,7 @@ function drawCircularText(ctx, text, centerX, centerY, radius) {
 }
 
 // Main loop to draw grid
-for (let y = 50; y < canvas.height; y += spacing) {
+for (let y = 50; y < canvas.height; y += spacing)
     for (let x = 50; x < canvas.width; x += spacing) {
 
         // Outer ring
