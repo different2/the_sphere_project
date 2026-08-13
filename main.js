@@ -40,14 +40,21 @@ let animationStarted = false;
 // 0 = crisp texture mode
 let useDots = 0;
 
-// How many copies of the current custom image/text appear on the globe.
+// How many copies of the current custom image appear on the globe.
+// Only applies to Upload Image - Text Message always uses the full sphere
+// wrap (see applyCustomText).
 // 1 = single image stretched to wrap the whole sphere once.
-// 2/3 = that many circular "logo" copies placed around the sphere.
+// 2/3/4/6 = that many circular "logo" copies placed around the sphere.
 let faceCount = 1;
 
 // 'randomized' = current/default tumbling dual-axis spin.
 // 'axis' = clean single-axis spin, like a globe on a stand.
 let spinType = 'randomized';
+
+// When true, phi/theta stop auto-incrementing each frame (but the scene
+// keeps rendering), so the manual Phi/Theta sliders actually stick instead
+// of being overwritten on the next frame.
+let isPaused = false;
 
 // Per-frame rotation increments for the live animation. Kept as named
 // constants (rather than inline magic numbers) because the GIF exporter
@@ -61,9 +68,16 @@ const THETA_RATE = 0.004;
 // 'image' | 'text' | null
 let activeCustomKind = null;
 
-// Cached source for the currently active custom image, so switching Face
-// Count doesn't require re-uploading the file.
-let rawCustomImage = null;
+// Cached per-face source images for the currently active custom image
+// upload, so switching Face Count or editing a single face doesn't
+// require re-uploading everything. Keyed by face index (0 = primary,
+// used for every face that doesn't have its own override, and used
+// as-is for faceCount === 1 full-wrap mode).
+let rawCustomImages = {};
+
+// Highest face count the per-face upload UI supports - matches the
+// highest value in the Face Count radio group.
+const MAX_FACE_SLOTS = 6;
 
 let isExportingGif = false;
 
@@ -380,6 +394,21 @@ function getFaceCenters(faceCount) {
         return centers;
     }
 
+    if (faceCount === 4) {
+
+        // The same four equatorial positions used by the 6-face
+        // layout below, just without the two poles. This keeps 4->6
+        // a consistent progression: going from 4 to 6 faces only
+        // adds the poles, it doesn't rearrange anything that was
+        // already placed.
+        return [
+            { x: 0, y: 0, z: 1 },
+            { x: 1, y: 0, z: 0 },
+            { x: 0, y: 0, z: -1 },
+            { x: -1, y: 0, z: 0 }
+        ];
+    }
+
     // 6 faces: original Laughing Man layout (unchanged).
     // Two poles + four equatorial positions.
     return [
@@ -400,10 +429,20 @@ function getFaceCenters(faceCount) {
 
 // Bigger patches look better when there are fewer of them spread around
 // the sphere. 6 keeps the original Laughing Man sizing untouched.
+//
+// NOTE for future face counts (5, 7-10, etc.): this is intentionally a
+// simple per-count lookup rather than a general N-point sphere-distribution
+// algorithm, since only 1/2/3/4/6 are needed today. If more counts are
+// added later, getFaceCenters() above is the function to generalize (e.g.
+// a Fibonacci-sphere or similar even-distribution formula) - everything
+// else (generateGlobeTexture, the per-face image UI, etc.) already just
+// asks "how many faces, and what are their centers" and doesn't otherwise
+// care what count it is.
 function getAngularRadiusForFaceCount(faceCount) {
 
     if (faceCount === 2) return 45;
     if (faceCount === 3) return 36;
+    if (faceCount === 4) return 32;
 
     return 28;
 }
@@ -458,12 +497,19 @@ function generateFullWrapTexture(
 // Generate multi-logo globe texture
 //
 // faceCount = 1: delegates to generateFullWrapTexture (see above).
-// faceCount = 2/3/6: places that many circular copies of logoImg
-// around the sphere (gnomonic tangent-plane projection per face).
+// `source` is a single image/canvas in that case.
+//
+// faceCount = 2/3/4/6: places that many circular copies around the
+// sphere (gnomonic tangent-plane projection per face). `source` here
+// is an ARRAY of length faceCount - one image per face, so each face
+// can (optionally) show something different. Each face's image keeps
+// its own aspect ratio/scale, computed independently, so mixing a
+// portrait photo on one face and a square logo on another still
+// fills each circular patch sensibly.
 // ============================================================
 
 function generateGlobeTexture(
-    logoImg,
+    source,
     angularRadiusDeg = 28,
     texWidth = 2048,
     faceCount = 6
@@ -472,7 +518,7 @@ function generateGlobeTexture(
     if (faceCount === 1) {
 
         return generateFullWrapTexture(
-            logoImg,
+            source,
             texWidth
         );
     }
@@ -501,38 +547,6 @@ function generateGlobeTexture(
     }
 
     // --------------------------------------------------------
-    // Read original logo
-    // --------------------------------------------------------
-
-    const logoCanvas =
-        document.createElement('canvas');
-
-    logoCanvas.width =
-        logoImg.width;
-
-    logoCanvas.height =
-        logoImg.height;
-
-    const logoCtx =
-        logoCanvas.getContext('2d', {
-            willReadFrequently: true
-        });
-
-    logoCtx.drawImage(
-        logoImg,
-        0,
-        0
-    );
-
-    const logoPixels =
-        logoCtx.getImageData(
-            0,
-            0,
-            logoImg.width,
-            logoImg.height
-        ).data;
-
-    // --------------------------------------------------------
     // Face positions for this face count
     // --------------------------------------------------------
 
@@ -550,7 +564,7 @@ function generateGlobeTexture(
         );
 
     // --------------------------------------------------------
-    // Logo size
+    // Angular size shared by every face
     // --------------------------------------------------------
 
     const radiusRad =
@@ -561,14 +575,65 @@ function generateGlobeTexture(
     const halfSize =
         Math.tan(radiusRad);
 
-    const logoRadius =
-        Math.max(
-            logoImg.width,
-            logoImg.height
-        ) / 2;
+    // --------------------------------------------------------
+    // Per-face image resources.
+    //
+    // `source` is either one image (same picture on every face) or
+    // an array with one entry per face (different picture per face).
+    // Each face reads its own pixels and computes its own logoScale
+    // from its own width/height, since different faces can have
+    // different source images with different dimensions.
+    // --------------------------------------------------------
 
-    const logoScale =
-        halfSize / logoRadius;
+    const images =
+        Array.isArray(source) ?
+            source :
+            centers.map(() => source);
+
+    const faces =
+        images.map((img) => {
+
+            const logoCanvas =
+                document.createElement('canvas');
+
+            logoCanvas.width =
+                img.width;
+
+            logoCanvas.height =
+                img.height;
+
+            const logoCtx =
+                logoCanvas.getContext('2d', {
+                    willReadFrequently: true
+                });
+
+            logoCtx.drawImage(
+                img,
+                0,
+                0
+            );
+
+            const pixels =
+                logoCtx.getImageData(
+                    0,
+                    0,
+                    img.width,
+                    img.height
+                ).data;
+
+            const logoRadius =
+                Math.max(
+                    img.width,
+                    img.height
+                ) / 2;
+
+            return {
+                width: img.width,
+                height: img.height,
+                pixels,
+                logoScale: halfSize / logoRadius
+            };
+        });
 
     // --------------------------------------------------------
     // Output pixel buffer
@@ -600,16 +665,16 @@ function generateGlobeTexture(
     }
 
     // --------------------------------------------------------
-    // Bilinear sample from original logo
+    // Bilinear sample from a given face's image
     // --------------------------------------------------------
 
-    function sampleLogo(lx, ly) {
+    function sampleFace(face, lx, ly) {
 
         if (
             lx < 0 ||
             ly < 0 ||
-            lx >= logoImg.width ||
-            ly >= logoImg.height
+            lx >= face.width ||
+            ly >= face.height
         ) {
             return null;
         }
@@ -623,13 +688,13 @@ function generateGlobeTexture(
         const x1 =
             Math.min(
                 x0 + 1,
-                logoImg.width - 1
+                face.width - 1
             );
 
         const y1 =
             Math.min(
                 y0 + 1,
-                logoImg.height - 1
+                face.height - 1
             );
 
         const fx =
@@ -641,13 +706,13 @@ function generateGlobeTexture(
         function pixel(x, y) {
 
             const index =
-                (y * logoImg.width + x) * 4;
+                (y * face.width + x) * 4;
 
             return [
-                logoPixels[index],
-                logoPixels[index + 1],
-                logoPixels[index + 2],
-                logoPixels[index + 3]
+                face.pixels[index],
+                face.pixels[index + 1],
+                face.pixels[index + 2],
+                face.pixels[index + 3]
             ];
         }
 
@@ -726,7 +791,7 @@ function generateGlobeTexture(
             let output = null;
 
             // ------------------------------------------------
-            // Try each logo
+            // Try each face
             // ------------------------------------------------
 
             for (
@@ -740,6 +805,9 @@ function generateGlobeTexture(
 
                 const basis =
                     bases[i];
+
+                const face =
+                    faces[i];
 
                 const centerDot =
                     dot3(
@@ -783,19 +851,21 @@ function generateGlobeTexture(
                     ) / centerDot;
 
                 // --------------------------------------------
-                // Convert tangent position to logo pixels
+                // Convert tangent position to this face's
+                // image pixels
                 // --------------------------------------------
 
                 const lx =
-                    tangentX / logoScale +
-                    logoImg.width / 2;
+                    tangentX / face.logoScale +
+                    face.width / 2;
 
                 const ly =
-                    logoImg.height / 2 -
-                    tangentY / logoScale;
+                    face.height / 2 -
+                    tangentY / face.logoScale;
 
                 const sampled =
-                    sampleLogo(
+                    sampleFace(
+                        face,
                         lx,
                         ly
                     );
@@ -983,24 +1053,74 @@ async function loadLaughingMan() {
 }
 
 // ============================================================
-// Apply the currently-selected custom image, using whatever face
-// count is currently selected. Called on first upload AND whenever
-// Face Count changes while an image is active.
+// Set the image for one face slot (0 = primary/fallback, 1-5 = an
+// override for that specific face) and regenerate.
+//
+// Setting the primary (slot 0) starts fresh and clears any existing
+// per-face overrides, since a whole new primary image usually means
+// "start over" rather than "keep my old overrides on a new base".
 // ============================================================
 
-async function applyCustomImage(image) {
+async function applyCustomImage(image, faceIndex = 0) {
 
-    rawCustomImage = image;
     activeCustomKind = 'image';
+
+    if (faceIndex === 0) {
+
+        rawCustomImages = {
+            0: image
+        };
+
+    } else {
+
+        rawCustomImages[faceIndex] = image;
+    }
+
+    await regenerateCustomImageTexture();
+
+    renderFaceSlotThumbnails();
+}
+
+// ============================================================
+// Rebuilds the globe texture from whatever is currently in
+// rawCustomImages + faceCount, resolving any un-set face slots to
+// the primary (slot 0) image. Called after a face image changes AND
+// whenever Face Count changes while an image is active.
+// ============================================================
+
+async function regenerateCustomImageTexture() {
+
+    if (!rawCustomImages[0]) {
+        return;
+    }
 
     try {
 
         const angularRadius =
             getAngularRadiusForFaceCount(faceCount);
 
+        let source;
+
+        if (faceCount === 1) {
+
+            source = rawCustomImages[0];
+
+        } else {
+
+            source = [];
+
+            for (let i = 0; i < faceCount; i++) {
+
+                source.push(
+                    rawCustomImages[i] ||
+                    rawCustomImages[0]
+                );
+            }
+        }
+
         const generatedCanvas =
             generateGlobeTexture(
-                image,
+                source,
                 angularRadius,
                 2048,
                 faceCount
@@ -1027,9 +1147,9 @@ async function applyCustomImage(image) {
 }
 
 // ============================================================
-// Apply user-entered text, using whatever face count is currently
-// selected. Called whenever the text input changes AND whenever
-// Face Count changes while text is active.
+// Apply user-entered text. Text always uses the full sphere wrap
+// (faceCount 1) - it doesn't participate in the multi-face system
+// that images use. Called whenever the text box changes.
 // ============================================================
 
 async function applyCustomText(text) {
@@ -1041,15 +1161,12 @@ async function applyCustomText(text) {
         const textCanvas =
             createTextTexture(text);
 
-        const angularRadius =
-            getAngularRadiusForFaceCount(faceCount);
-
         const generatedCanvas =
             generateGlobeTexture(
                 textCanvas,
-                angularRadius,
+                28,
                 2048,
-                faceCount
+                1
             );
 
         const textureDataUrl =
@@ -1060,7 +1177,7 @@ async function applyCustomText(text) {
         await loadTexture(textureDataUrl);
 
         console.log(
-            `Custom text texture loaded (${faceCount} face(s))`
+            "Custom text texture loaded (full wrap)"
         );
 
     } catch (error) {
@@ -1381,19 +1498,24 @@ function animate() {
         return;
     }
 
-    if (spinType === 'axis') {
+    // Paused: keep rendering every frame (so the Phi/Theta sliders
+    // stay live and responsive), just stop auto-incrementing them.
+    if (!isPaused) {
 
-        // Clean single-axis spin, like a globe on a stand. Theta is
-        // left alone so the manual Theta slider still works as a
-        // fixed tilt.
-        phi += PHI_RATE;
+        if (spinType === 'axis') {
 
-    } else {
+            // Clean single-axis spin, like a globe on a stand. Theta
+            // is left alone so the manual Theta slider still works
+            // as a fixed tilt.
+            phi += PHI_RATE;
 
-        // Randomized/tumbling dual-axis spin (default/original
-        // behavior).
-        phi += PHI_RATE;
-        theta += THETA_RATE;
+        } else {
+
+            // Randomized/tumbling dual-axis spin (default/original
+            // behavior).
+            phi += PHI_RATE;
+            theta += THETA_RATE;
+        }
     }
 
     const uniforms = {
@@ -1560,6 +1682,41 @@ if (spinTypeControl) {
             spinType =
                 e.target.value;
 
+            if (spinType === 'axis') {
+
+                /*
+                 * Normalize to a clean, non-tilted view: poles
+                 * straight up/down, no leftover wobble from
+                 * Randomized. Phi is left alone so the spin itself
+                 * doesn't jump.
+                 */
+                theta = 0;
+
+                if (thetaControl) {
+                    thetaControl.value = 0;
+                }
+            }
+
+        }
+    );
+}
+
+// ============================================================
+// Pause spin
+// ============================================================
+
+const pauseSpinToggle =
+    document.getElementById('pauseSpinToggle');
+
+if (pauseSpinToggle) {
+
+    pauseSpinToggle.addEventListener(
+        'change',
+        (e) => {
+
+            isPaused =
+                e.target.checked;
+
         }
     );
 }
@@ -1595,24 +1752,11 @@ faceCountInputs.forEach(
                     faceCount
                 );
 
-                if (
-                    activeCustomKind === 'image' &&
-                    rawCustomImage
-                ) {
+                renderFaceSlotThumbnails();
 
-                    await applyCustomImage(
-                        rawCustomImage
-                    );
+                if (activeCustomKind === 'image') {
 
-                } else if (
-                    activeCustomKind === 'text'
-                ) {
-
-                    await applyCustomText(
-                        customTextInput ?
-                            customTextInput.value :
-                            'HELLO WORLD!'
-                    );
+                    await regenerateCustomImageTexture();
                 }
 
             }
@@ -1676,6 +1820,12 @@ const textEntryGroup =
 const faceCountGroup =
     document.getElementById('faceCountGroup');
 
+const perFaceGroup =
+    document.getElementById('perFaceGroup');
+
+const faceSlotsContainer =
+    document.getElementById('faceSlots');
+
 function setContextualControlsVisible({
     upload = false,
     text = false,
@@ -1696,6 +1846,166 @@ function setContextualControlsVisible({
         faceCountGroup.style.display =
             faces ? 'block' : 'none';
     }
+
+    if (!faces && perFaceGroup) {
+        perFaceGroup.style.display = 'none';
+    }
+}
+
+// ============================================================
+// Per-face image upload slots
+//
+// Generated once (up to MAX_FACE_SLOTS), shown/hidden per current
+// faceCount. Slot 0 ("Face 1") is the primary image - setting it
+// clears other overrides (see applyCustomImage). Slots 1+ are
+// optional per-face overrides that fall back to the primary when
+// left unset.
+// ============================================================
+
+const faceSlotButtons = [];
+
+if (faceSlotsContainer) {
+
+    for (let i = 0; i < MAX_FACE_SLOTS; i++) {
+
+        const thumb =
+            document.createElement('button');
+
+        thumb.type = 'button';
+        thumb.className = 'face-slot-thumb';
+        thumb.title = `Face ${i + 1}`;
+        thumb.textContent = String(i + 1);
+
+        const slotFileInput =
+            document.createElement('input');
+
+        slotFileInput.type = 'file';
+        slotFileInput.accept = 'image/*';
+        slotFileInput.style.display = 'none';
+
+        thumb.addEventListener(
+            'click',
+            () => slotFileInput.click()
+        );
+
+        slotFileInput.addEventListener(
+            'change',
+            (e) => {
+
+                const file =
+                    e.target.files[0];
+
+                if (!file) {
+                    return;
+                }
+
+                if (
+                    !file.type.startsWith('image/')
+                ) {
+
+                    alert(
+                        "Please select an image file."
+                    );
+
+                    e.target.value = '';
+
+                    return;
+                }
+
+                const reader =
+                    new FileReader();
+
+                reader.onload =
+                    (event) => {
+
+                        const img =
+                            new Image();
+
+                        img.onload =
+                            async () => {
+
+                                await applyCustomImage(
+                                    img,
+                                    i
+                                );
+                            };
+
+                        img.src =
+                            event.target.result;
+                    };
+
+                reader.readAsDataURL(file);
+
+                e.target.value = '';
+            }
+        );
+
+        faceSlotsContainer.appendChild(thumb);
+        faceSlotsContainer.appendChild(slotFileInput);
+
+        faceSlotButtons.push({
+            thumb,
+            fileInput: slotFileInput
+        });
+    }
+}
+
+function renderFaceSlotThumbnails() {
+
+    if (
+        !perFaceGroup ||
+        faceSlotButtons.length === 0
+    ) {
+        return;
+    }
+
+    const shouldShow =
+        activeCustomKind === 'image' &&
+        faceCount > 1;
+
+    perFaceGroup.style.display =
+        shouldShow ? 'flex' : 'none';
+
+    if (!shouldShow) {
+        return;
+    }
+
+    faceSlotButtons.forEach(
+        (slot, i) => {
+
+            if (i >= faceCount) {
+
+                slot.thumb.style.display = 'none';
+
+                return;
+            }
+
+            slot.thumb.style.display = 'flex';
+
+            const img =
+                rawCustomImages[i] ||
+                rawCustomImages[0];
+
+            if (img && img.src) {
+
+                slot.thumb.style.backgroundImage =
+                    `url(${img.src})`;
+
+                slot.thumb.textContent = '';
+
+                slot.thumb.classList.toggle(
+                    'is-override',
+                    Boolean(rawCustomImages[i])
+                );
+
+            } else {
+
+                slot.thumb.style.backgroundImage = '';
+                slot.thumb.textContent = String(i + 1);
+                slot.thumb.classList.remove('is-override');
+            }
+        }
+    );
 }
 
 if (
@@ -1731,6 +2041,8 @@ if (
                     faces: true
                 });
 
+                renderFaceSlotThumbnails();
+
                 setUseDots(false);
 
                 setTimeout(
@@ -1758,7 +2070,7 @@ if (
 
                 setContextualControlsVisible({
                     text: true,
-                    faces: true
+                    faces: false
                 });
 
                 setUseDots(true);
@@ -1778,6 +2090,8 @@ if (
             // ------------------------------------------------
 
             activeCustomKind = null;
+
+            renderFaceSlotThumbnails();
 
             setContextualControlsVisible({});
 
@@ -1943,7 +2257,7 @@ if (fileUpload) {
 // ============================================================
 
 const EXPORT_FRAME_COUNT = 72;
-const EXPORT_FRAME_DELAY_MS = 45;
+const EXPORT_FRAME_DELAY_MS = 150;
 const EXPORT_SIZE = 480;
 
 const exportGifBtn =

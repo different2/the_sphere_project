@@ -113,7 +113,7 @@
             margin-left: 10px;
         }
 
-        .text-entry input[type="text"] {
+        .text-entry textarea {
             width: 132px;
             margin-left: 10px;
             background: rgba(255, 255, 255, 0.1);
@@ -123,19 +123,23 @@
             padding: 3px 4px;
             font-size: 12px;
             font-family: Arial, sans-serif;
+            resize: vertical;
+            vertical-align: top;
         }
 
-        .text-entry input[type="text"]::placeholder {
+        .text-entry textarea::placeholder {
             color: rgba(255, 255, 255, 0.4);
         }
 
-        .face-count-group {
+        .face-count-group,
+        .per-face-group {
             display: flex;
-            align-items: center;
+            align-items: flex-start;
         }
 
         .radio-row {
             display: flex;
+            flex-wrap: wrap;
             gap: 6px;
             margin-left: 10px;
         }
@@ -161,6 +165,40 @@
 
         .radio-pill:has(input:checked) {
             background: rgba(77, 166, 255, 0.35);
+            border-color: #4da6ff;
+        }
+
+        .face-slots {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 5px;
+            margin-left: 10px;
+            max-width: 132px;
+        }
+
+        .face-slot-thumb {
+            width: 28px;
+            height: 28px;
+            padding: 0;
+            border-radius: 5px;
+            border: 1px solid rgba(255, 255, 255, 0.25);
+            background-color: rgba(255, 255, 255, 0.08);
+            background-size: cover;
+            background-position: center;
+            color: rgba(255, 255, 255, 0.8);
+            font-size: 11px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: border-color 0.15s ease-out;
+        }
+
+        .face-slot-thumb:hover {
+            border-color: rgba(255, 255, 255, 0.6);
+        }
+
+        .face-slot-thumb.is-override {
             border-color: #4da6ff;
         }
 

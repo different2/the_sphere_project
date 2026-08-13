@@ -24,7 +24,7 @@
 
             <div class="control-group text-entry" id="textEntryGroup" style="display: none;">
                 <label for="customTextInput">Your text:</label>
-                <input type="text" id="customTextInput" maxlength="60" value="HELLO WORLD!" placeholder="HELLO WORLD!">
+                <textarea id="customTextInput" maxlength="500" rows="3" placeholder="HELLO WORLD!">HELLO WORLD!</textarea>
             </div>
 
             <div class="control-group face-count-group" id="faceCountGroup" style="display: none;">
@@ -42,7 +42,20 @@
                         <input type="radio" name="faceCount" value="3">
                         <span>3</span>
                     </label>
+                    <label class="radio-pill">
+                        <input type="radio" name="faceCount" value="4">
+                        <span>4</span>
+                    </label>
+                    <label class="radio-pill">
+                        <input type="radio" name="faceCount" value="6">
+                        <span>6</span>
+                    </label>
                 </div>
+            </div>
+
+            <div class="control-group per-face-group" id="perFaceGroup" style="display: none;">
+                <label>Per-face:</label>
+                <div class="face-slots" id="faceSlots"></div>
             </div>
 
             <div class="control-group checkbox-row">
@@ -58,10 +71,15 @@
                 </select>
             </div>
 
-            <!-- <div class="control-group">
+            <div class="control-group checkbox-row">
+                <label for="pauseSpinToggle">Pause spin:</label>
+                <input type="checkbox" id="pauseSpinToggle">
+            </div>
+
+            <div class="control-group">
                 <label>Phi:</label>
                 <input type="range" id="phi" min="0" max="6.28" step="0.01" value="0">
-            </div> -->
+            </div>
             <div class="control-group">
                 <label>Theta:</label>
                 <input type="range" id="theta" min="0" max="6.28" step="0.01" value="0">
