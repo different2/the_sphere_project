@@ -21,21 +21,63 @@
             <div class="file-upload">
                 <input type="file" id="fileUpload" accept="image/*" style="display: none;">
             </div>
+
+            <div class="control-group text-entry" id="textEntryGroup" style="display: none;">
+                <label for="customTextInput">Your text:</label>
+                <input type="text" id="customTextInput" maxlength="60" value="HELLO WORLD!" placeholder="HELLO WORLD!">
+            </div>
+
+            <div class="control-group face-count-group" id="faceCountGroup" style="display: none;">
+                <label>Faces:</label>
+                <div class="radio-row">
+                    <label class="radio-pill">
+                        <input type="radio" name="faceCount" value="1" checked>
+                        <span>1 (wrap)</span>
+                    </label>
+                    <label class="radio-pill">
+                        <input type="radio" name="faceCount" value="2">
+                        <span>2</span>
+                    </label>
+                    <label class="radio-pill">
+                        <input type="radio" name="faceCount" value="3">
+                        <span>3</span>
+                    </label>
+                </div>
+            </div>
+
+            <div class="control-group checkbox-row">
+                <label for="useDotsToggle">Fibonacci dots:</label>
+                <input type="checkbox" id="useDotsToggle">
+            </div>
+
             <div class="control-group">
+                <label for="spinType">Spin:</label>
+                <select id="spinType">
+                    <option value="randomized">Randomized (tumble)</option>
+                    <option value="axis">Axis (like a stand)</option>
+                </select>
+            </div>
+
+            <!-- <div class="control-group">
                 <label>Phi:</label>
                 <input type="range" id="phi" min="0" max="6.28" step="0.01" value="0">
-            </div>
+            </div> -->
             <div class="control-group">
                 <label>Theta:</label>
                 <input type="range" id="theta" min="0" max="6.28" step="0.01" value="0">
             </div>
             <div class="control-group">
-                <label>Dots:</label>
+                <label>Dot Count:</label>
                 <input type="range" id="dots" min="1000" max="100000" step="1000" value="25000">
             </div>
             <div class="control-group">
                 <label>Scale:</label>
                 <input type="range" id="scale" min="0.5" max="1.5" step="0.05" value="1.0">
+            </div>
+
+            <div class="control-group export-group">
+                <button type="button" id="exportGifBtn">Export Loopable GIF</button>
+                <div id="exportStatus" class="export-status"></div>
             </div>
         </div>
         <div class="globe-container">
