@@ -2256,8 +2256,8 @@ if (fileUpload) {
 // return to their starting values.
 // ============================================================
 
-const EXPORT_FRAME_COUNT = 72;
-const EXPORT_FRAME_DELAY_MS = 150;
+const EXPORT_FRAME_COUNT = 129;
+const EXPORT_FRAME_DELAY_MS = 83;
 const EXPORT_SIZE = 480;
 
 const exportGifBtn =
@@ -2442,15 +2442,14 @@ async function exportLoopableGif() {
 
             const palette =
                 quantize(frameData, 256, {
-                    format: 'rgba4444',
-                    oneBitAlpha: true
+                    format: 'rgb565',
                 });
 
             const index =
-                applyPalette(frameData, palette, 'rgba4444');
+                applyPalette(frameData, palette, 'rgb565');
 
-            const transparentIndex =
-                palette.findIndex(c => c[3] === 0);
+            // const transparentIndex =
+            //     palette.findIndex(c => c[3] === 0);
 
             gif.writeFrame(
                 index,
@@ -2459,8 +2458,8 @@ async function exportLoopableGif() {
                 {
                     palette,
                     delay: EXPORT_FRAME_DELAY_MS,
-                    transparent: transparentIndex >= 0,
-                    transparentIndex: Math.max(0, transparentIndex),
+                    // transparent: transparentIndex >= 0,
+                    // transparentIndex: Math.max(0, transparentIndex),
                     first: i === 0,
                     repeat: 0
                 }
