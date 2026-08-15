@@ -79,6 +79,27 @@ let rawCustomImages = {};
 // highest value in the Face Count radio group.
 const MAX_FACE_SLOTS = 6;
 
+// ============================================================
+// Laughing Man spinning text ring
+//
+// Only meaningful when Laughing Man is the active texture (and not in
+// dot mode - see setUseDots/animateRing wiring below). The six face
+// centers, 28-degree angular radius, and the raw logo's own pixel
+// geometry are hardcoded to match in fragmentShader.js's
+// sampleRingFace() - this feature is specific to this one built-in
+// asset, not a general system, so there's nothing to keep in sync here
+// beyond the rotation angle itself.
+// ============================================================
+
+let animateRing = false;
+let ringAngle = 0;
+const RING_ROTATION_RATE = 0.012;
+
+// Bound to texture unit 1 once at startup (see createGlobe) and left
+// alone after that - it's the raw, un-composited Laughing Man PNG,
+// separate from uTexture (the baked six-logo equirect map).
+let logoTexture = null;
+
 let isExportingGif = false;
 
 // ============================================================
@@ -1020,6 +1041,31 @@ async function loadLaughingMan() {
             `Original Laughing Man: ${image.width}x${image.height}`
         );
 
+        // Raw (un-composited) logo texture for the spinning text ring,
+        // bound once to its own texture unit and left there - see
+        // fragmentShader.js's sampleRingFace().
+        if (!logoTexture) {
+
+            logoTexture =
+                await createTexture(
+                    p.gl,
+                    textures.laughingMan
+                );
+
+            console.log(
+                "Laughing Man raw logo texture loaded (for ring rotation)"
+            );
+        }
+
+        p.gl.activeTexture(
+            p.gl.TEXTURE1
+        );
+
+        p.gl.bindTexture(
+            p.gl.TEXTURE_2D,
+            logoTexture
+        );
+
         // Generate six-logo globe
         const generatedCanvas =
             generateGlobeTexture(
@@ -1038,6 +1084,8 @@ async function loadLaughingMan() {
         await loadTexture(textureData);
 
         setUseDots(false);
+
+        animateRing = true;
 
         console.log(
             "Laughing Man globe texture loaded successfully"
@@ -1064,6 +1112,7 @@ async function loadLaughingMan() {
 async function applyCustomImage(image, faceIndex = 0) {
 
     activeCustomKind = 'image';
+    animateRing = false;
 
     if (faceIndex === 0) {
 
@@ -1155,6 +1204,7 @@ async function regenerateCustomImageTexture() {
 async function applyCustomText(text) {
 
     activeCustomKind = 'text';
+    animateRing = false;
 
     try {
 
@@ -1285,6 +1335,21 @@ async function createGlobe() {
 
                     uTexture: {
                         type: "sampler2D",
+                        value: 0
+                    },
+
+                    uLogoTexture: {
+                        type: "sampler2D",
+                        value: 1
+                    },
+
+                    uAnimateRing: {
+                        type: "float",
+                        value: 0
+                    },
+
+                    uRingAngle: {
+                        type: "float",
                         value: 0
                     },
 
@@ -1516,6 +1581,10 @@ function animate() {
             phi += PHI_RATE;
             theta += THETA_RATE;
         }
+
+        if (animateRing) {
+            ringAngle += RING_ROTATION_RATE;
+        }
     }
 
     const uniforms = {
@@ -1543,6 +1612,16 @@ function animate() {
         uUseDots: {
             type: "float",
             value: useDots
+        },
+
+        uAnimateRing: {
+            type: "float",
+            value: animateRing ? 1 : 0
+        },
+
+        uRingAngle: {
+            type: "float",
+            value: ringAngle
         }
 
     };
@@ -2091,6 +2170,8 @@ if (
 
             activeCustomKind = null;
 
+            animateRing = false;
+
             renderFaceSlotThumbnails();
 
             setContextualControlsVisible({});
@@ -2256,8 +2337,8 @@ if (fileUpload) {
 // return to their starting values.
 // ============================================================
 
-const EXPORT_FRAME_COUNT = 129;
-const EXPORT_FRAME_DELAY_MS = 83;
+const EXPORT_FRAME_COUNT = 72;
+const EXPORT_FRAME_DELAY_MS = 45;
 const EXPORT_SIZE = 480;
 
 const exportGifBtn =
@@ -2358,23 +2439,29 @@ async function exportLoopableGif() {
 
     const startPhi = phi;
     const startTheta = theta;
+    const startRingAngle = ringAngle;
+
+    // Ring rotation isn't tied to phi/theta's rate, so to keep the loop
+    // seamless it needs its own whole number of revolutions over the
+    // same EXPORT_FRAME_COUNT frames. Picking the integer closest to
+    // how many revolutions it would naturally complete during one live
+    // sphere-loop keeps the exported speed close to what's seen live,
+    // while still guaranteeing an exact loop (fractional revolutions
+    // would leave a visible jump where the GIF repeats).
+    const livePhiStepsPerLoop =
+        spinType === 'axis' ?
+            (2 * Math.PI) / PHI_RATE :
+            (4 * Math.PI) / PHI_RATE;
+
+    const naturalRingRevolutions =
+        (RING_ROTATION_RATE * livePhiStepsPerLoop) / (2 * Math.PI);
+
+    const ringRevolutions =
+        Math.max(1, Math.round(naturalRingRevolutions));
 
     try {
 
-        // ------------------------------------------------------------
-        // GIF export settings
-        // ------------------------------------------------------------
-
-        const EXPORT_SIZE = 500;
-
-        // ~12 FPS.
-        // 120 frames gives a 10-second animation.
-        const EXPORT_FRAME_COUNT = 120;
-        const EXPORT_FRAME_DELAY_MS = 83;
-
-        // ------------------------------------------------------------
-        // Canvases
-        // ------------------------------------------------------------
+        const gif = GIFEncoder();
 
         const cropCanvas =
             document.createElement('canvas');
@@ -2389,19 +2476,6 @@ async function exportLoopableGif() {
             exportCanvas.getContext('2d', {
                 willReadFrequently: true
             });
-
-        // ------------------------------------------------------------
-        // Store every rendered frame.
-        //
-        // We need all frames before encoding because we want to build
-        // ONE shared palette for the entire animation.
-        // ------------------------------------------------------------
-
-        const frames = [];
-
-        // ------------------------------------------------------------
-        // Render all frames
-        // ------------------------------------------------------------
 
         for (let i = 0; i < EXPORT_FRAME_COUNT; i++) {
 
@@ -2418,50 +2492,31 @@ async function exportLoopableGif() {
 
             if (spinType === 'axis') {
 
-                framePhi =
-                    startPhi + t;
-
-                frameTheta =
-                    startTheta;
+                framePhi = startPhi + t;
+                frameTheta = startTheta;
 
             } else {
 
-                frameTheta =
-                    startTheta + t;
-
-                framePhi =
-                    startPhi + t * 2;
+                frameTheta = startTheta + t;
+                framePhi = startPhi + t * 2;
             }
 
-            // Render the WebGL globe.
+            const frameRingAngle =
+                startRingAngle +
+                (i / EXPORT_FRAME_COUNT) * ringRevolutions * Math.PI * 2;
+
             instance.render({
-                phi: {
-                    type: "float",
-                    value: framePhi
-                },
 
-                theta: {
-                    type: "float",
-                    value: frameTheta
-                },
+                phi: { type: "float", value: framePhi },
+                theta: { type: "float", value: frameTheta },
+                dots: { type: "float", value: dots },
+                scale: { type: "float", value: scale },
+                uUseDots: { type: "float", value: useDots },
+                uAnimateRing: { type: "float", value: animateRing ? 1 : 0 },
+                uRingAngle: { type: "float", value: frameRingAngle }
 
-                dots: {
-                    type: "float",
-                    value: dots
-                },
-
-                scale: {
-                    type: "float",
-                    value: scale
-                },
-
-                uUseDots: {
-                    type: "float",
-                    value: useDots
-                }
             });
 
-            // Crop the WebGL canvas exactly as the existing exporter does.
             const imageData =
                 readGlobeCropAsImageData(
                     p.gl,
@@ -2469,234 +2524,77 @@ async function exportLoopableGif() {
                     canvas.height
                 );
 
-            cropCanvas.width =
-                imageData.width;
-
-            cropCanvas.height =
-                imageData.height;
+            cropCanvas.width = imageData.width;
+            cropCanvas.height = imageData.height;
 
             cropCanvas
                 .getContext('2d')
-                .putImageData(
-                    imageData,
-                    0,
-                    0
-                );
+                .putImageData(imageData, 0, 0);
 
-            // Resize to the final 500x500 GIF dimensions.
             exportCtx.clearRect(
-                0,
-                0,
-                EXPORT_SIZE,
-                EXPORT_SIZE
+                0, 0, EXPORT_SIZE, EXPORT_SIZE
             );
 
             exportCtx.drawImage(
                 cropCanvas,
-
-                0,
-                0,
-                imageData.width,
-                imageData.height,
-
-                0,
-                0,
-                EXPORT_SIZE,
-                EXPORT_SIZE
+                0, 0, imageData.width, imageData.height,
+                0, 0, EXPORT_SIZE, EXPORT_SIZE
             );
 
-            // IMPORTANT:
-            // Copy the data because the canvas will be reused for
-            // the next frame.
             const frameData =
-                new Uint8Array(
-                    exportCtx.getImageData(
-                        0,
-                        0,
-                        EXPORT_SIZE,
-                        EXPORT_SIZE
-                    ).data
-                );
+                exportCtx.getImageData(
+                    0, 0, EXPORT_SIZE, EXPORT_SIZE
+                ).data;
 
-            frames.push(frameData);
+            const palette =
+                quantize(frameData, 256, {
+                    format: 'rgba4444',
+                    oneBitAlpha: true
+                });
 
-            // Yield periodically so the browser stays responsive.
-            if (i % 3 === 0) {
-                await nextAnimationFrame();
-            }
-        }
-
-        // ------------------------------------------------------------
-        // Build ONE palette for the entire animation.
-        //
-        // Rather than feeding all 120 full-resolution frames into
-        // quantize(), sample every 4th pixel. This gives the quantizer
-        // a representative view of the entire animation while keeping
-        // memory and processing reasonable.
-        // ------------------------------------------------------------
-
-        if (exportStatus) {
-            exportStatus.textContent =
-                'Building shared color palette...';
-        }
-
-        const PIXEL_STRIDE = 4;
-
-        const sampledPixelCount =
-            Math.ceil(
-                (EXPORT_SIZE * EXPORT_SIZE) /
-                PIXEL_STRIDE
-            ) * frames.length;
-
-        const paletteSource =
-            new Uint8Array(
-                sampledPixelCount * 4
-            );
-
-        let paletteOffset = 0;
-
-        for (const frame of frames) {
-
-            for (
-                let src = 0;
-                src < frame.length;
-                src += PIXEL_STRIDE * 4
-            ) {
-
-                paletteSource[paletteOffset++] =
-                    frame[src];
-
-                paletteSource[paletteOffset++] =
-                    frame[src + 1];
-
-                paletteSource[paletteOffset++] =
-                    frame[src + 2];
-
-                paletteSource[paletteOffset++] =
-                    frame[src + 3];
-            }
-        }
-
-        // Trim any unused bytes from the final allocation.
-        const palettePixels =
-            paletteSource.subarray(
-                0,
-                paletteOffset
-            );
-
-        // ------------------------------------------------------------
-        // Use RGB565.
-        //
-        // The previous exporter used RGBA4444, which is much more
-        // restrictive for the RGB information. Since we're treating
-        // the globe as an opaque GIF, RGB565 gives the quantizer more
-        // useful color information.
-        // ------------------------------------------------------------
-
-        const palette =
-            quantize(
-                palettePixels,
-                256,
-                {
-                    format: 'rgb565'
-                }
-            );
-
-        // ------------------------------------------------------------
-        // Create GIF encoder.
-        // ------------------------------------------------------------
-
-        const gif =
-            GIFEncoder();
-
-        // ------------------------------------------------------------
-        // Convert and encode each frame using the SAME palette.
-        // ------------------------------------------------------------
-
-        for (let i = 0; i < frames.length; i++) {
-
-            if (exportStatus) {
-                exportStatus.textContent =
-                    `Encoding frame ${i + 1}/${frames.length}...`;
-            }
-
-            const frame =
-                frames[i];
-
-            // Every frame uses the same global palette.
             const index =
-                applyPalette(
-                    frame,
-                    palette,
-                    'rgb565'
-                );
+                applyPalette(frameData, palette, 'rgba4444');
+
+            const transparentIndex =
+                palette.findIndex(c => c[3] === 0);
 
             gif.writeFrame(
                 index,
                 EXPORT_SIZE,
                 EXPORT_SIZE,
                 {
-                    // The palette is required on the first frame.
-                    // For subsequent frames, omitting it tells gifenc
-                    // to use the GIF's existing global palette.
-                    ...(i === 0
-                        ? { palette }
-                        : {}),
-
-                    delay:
-                        EXPORT_FRAME_DELAY_MS,
-
-                    first:
-                        i === 0,
-
-                    repeat:
-                        0
+                    palette,
+                    delay: EXPORT_FRAME_DELAY_MS,
+                    transparent: transparentIndex >= 0,
+                    transparentIndex: Math.max(0, transparentIndex),
+                    first: i === 0,
+                    repeat: 0
                 }
             );
 
-            // Give the browser some breathing room during encoding.
-            if (i % 2 === 0) {
+            // Yield periodically so the tab stays responsive.
+            if (i % 4 === 0) {
                 await nextAnimationFrame();
             }
         }
 
-        // ------------------------------------------------------------
-        // Finish GIF
-        // ------------------------------------------------------------
-
         gif.finish();
 
-        const bytes =
-            gif.bytes();
+        const bytes = gif.bytes();
 
         const blob =
-            new Blob(
-                [bytes],
-                {
-                    type: 'image/gif'
-                }
-            );
+            new Blob([bytes], { type: 'image/gif' });
 
         const url =
             URL.createObjectURL(blob);
 
-        // ------------------------------------------------------------
-        // Automatic download
-        // ------------------------------------------------------------
-
         const link =
             document.createElement('a');
 
-        link.href =
-            url;
-
-        link.download =
-            'globe-loop.gif';
-
+        link.href = url;
+        link.download = 'globe-loop.gif';
         document.body.appendChild(link);
-
         link.click();
-
         document.body.removeChild(link);
 
         setTimeout(
@@ -2704,22 +2602,15 @@ async function exportLoopableGif() {
             10000
         );
 
-        // ------------------------------------------------------------
-        // Status
-        // ------------------------------------------------------------
-
         if (exportStatus) {
-
             exportStatus.textContent =
                 `Done! (${(bytes.length / 1024).toFixed(0)} KB)`;
 
             setTimeout(
                 () => {
-
                     if (exportStatus) {
                         exportStatus.textContent = '';
                     }
-
                 },
                 4000
             );
@@ -2740,15 +2631,12 @@ async function exportLoopableGif() {
     } finally {
 
         // Restore the live rotation to where it was before export,
-        // then let the normal animation take back over.
-        phi =
-            startPhi;
+        // then let the normal loop take back over.
+        phi = startPhi;
+        theta = startTheta;
+        ringAngle = startRingAngle;
 
-        theta =
-            startTheta;
-
-        isExportingGif =
-            false;
+        isExportingGif = false;
 
         if (exportGifBtn) {
             exportGifBtn.disabled = false;

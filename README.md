@@ -8,6 +8,11 @@ texture or as a Fibonacci-lattice dot pattern.
 
 - **Texture** - Laughing Man (default), Earth Map, Text Message, or Upload
   Image.
+- **Laughing Man's text ring** spins on its own, continuously, while the
+  smiley face stays upright - on every visible copy of the logo at once,
+  correctly oriented no matter which side of the sphere it's on. Not a
+  toggle right now; it's just how Laughing Man looks. Automatically turns
+  off (and back on) as you switch texture modes.
 - **Your text** *(Text Message mode)* - a full multi-line box now, not just
   one line. Type a paragraph and it word-wraps and auto-sizes to fit; each
   line becomes its own horizontal band/ring around the globe (top line
@@ -45,6 +50,29 @@ texture or as a Fibonacci-lattice dot pattern.
 - Face counts other than 1/2/3/4/6 aren't supported yet, but
   `getFaceCenters()` in `main.js` is the one place to extend if that's
   ever needed - everything else just asks it "how many faces and where."
+- Fixed a latent GLSL naming collision in `fragmentShader.js` (a local
+  variable was named `sample`, which some GLSL compilers treat as a
+  reserved word) - purely a rename, no behavior change, found while
+  setting up real shader-compilation testing for the ring feature below.
+- **Flagged, not fixed:** `fragmentShader.js`'s `uv = uv * 1.0 - 1.0` (in
+  `main()`, computing the screen UV coordinates) looks like it should be
+  `* 2.0`, and this predates any of my changes - confirmed via `git diff`
+  against the original "adding laughing man" commit. With `* 1.0`, the
+  visible globe only occupies about a quarter of the frame, pushed into
+  one corner, instead of being centered - confirmed by actually compiling
+  and rendering the real shader through a headless WebGL context. I
+  didn't touch it since it's out of scope for what was asked this round,
+  but wanted to flag it clearly in case it's not intentional.
+
+## Laughing Man ring geometry
+
+`fragmentShader.js`'s `sampleRingFace()` reprojects the raw
+`assets/laughingman.png` per-pixel, at render time, to spin just the
+outer text ring while the face stays fixed - see the function's comments
+for the full approach. The face/ring boundary (415px from center, in the
+logo's own 1090x976 pixel space) and the six face centers/28-degree
+angular radius are hardcoded to match this one specific built-in asset -
+this isn't a general per-face-image animation system.
 
 ## Project structure
 

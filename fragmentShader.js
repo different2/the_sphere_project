@@ -25,6 +25,15 @@ const fragmentShader = /*glsl*/`
      */
     uniform float uUseDots;
 
+    /*
+     * Laughing Man spinning text ring (see sampleRingFace below).
+     * uLogoTexture is the raw, un-composited Laughing Man PNG - not
+     * the baked six-logo uTexture.
+     */
+    uniform sampler2D uLogoTexture;
+    uniform float uAnimateRing;
+    uniform float uRingAngle;
+
 
     const float sqrt5 = 2.23606797749979;
 
@@ -86,6 +95,127 @@ const fragmentShader = /*glsl*/`
             cy * cx
 
         );
+    }
+
+
+    // ========================================================
+    // Laughing Man spinning text ring
+    //
+    // The six-logo texture (uTexture) is still baked on the CPU exactly
+    // as before - this only handles the OUTER TEXT RING of each of the
+    // six Laughing Man logos, resampling it from the raw logo image
+    // (uLogoTexture) at a rotated angle so the ring spins while the
+    // static bake underneath (the face) shows through everywhere else.
+    //
+    // The six face centers, the 28-degree angular radius, and the raw
+    // logo's own pixel dimensions/center/ring-boundary are all fixed,
+    // known constants for this one specific built-in asset (not a
+    // general N-face system) - see the "Laughing Man ring geometry"
+    // note in main.js for how these numbers were derived.
+    // ========================================================
+
+    const int RING_MISS = 0;
+    const int RING_STATIC = 1;
+    const int RING_ROTATED = 2;
+
+    int sampleRingFace(
+        vec3 rP,
+        vec3 center,
+        float ringAngle,
+        out vec4 result
+    ) {
+
+        result = vec4(0.0);
+
+        vec3 reference =
+            abs(center.y) < 0.9
+            ? vec3(0.0, 1.0, 0.0)
+            : vec3(0.0, 0.0, 1.0);
+
+        vec3 east =
+            normalize(cross(reference, center));
+
+        vec3 north =
+            normalize(cross(center, east));
+
+        float centerDot =
+            dot(rP, center);
+
+        if (centerDot <= 0.0) {
+            return RING_MISS;
+        }
+
+        float angle =
+            acos(clamp(centerDot, -1.0, 1.0));
+
+        // 28 degrees in radians - matches the Laughing Man's fixed
+        // angular radius on the sphere.
+        if (angle > 0.4886921905584123) {
+            return RING_MISS;
+        }
+
+        float tangentX =
+            dot(rP, east) / centerDot;
+
+        float tangentY =
+            dot(rP, north) / centerDot;
+
+        // Matches main.js's generateGlobeTexture pixel mapping exactly
+        // (logoScale = tan(28deg) / 545, logo center = (545, 488)).
+        float lx =
+            tangentX / 0.0009756136360761079 + 545.0;
+
+        float ly =
+            488.0 - tangentY / 0.0009756136360761079;
+
+        vec2 rel =
+            vec2(lx, ly) - vec2(545.0, 488.0);
+
+        float distFromCenter =
+            length(rel);
+
+        // Inside the inner boundary ring: this is the static face/bar
+        // area, not the text ring - leave it to the caller's already-
+        // computed static sample.
+        if (distFromCenter < 415.0) {
+            return RING_STATIC;
+        }
+
+        float ca = cos(ringAngle);
+        float sa = sin(ringAngle);
+
+        vec2 rotRel =
+            vec2(
+                rel.x * ca - rel.y * sa,
+                rel.x * sa + rel.y * ca
+            );
+
+        vec2 ringPixel =
+            vec2(545.0, 488.0) + rotRel;
+
+        vec2 ringUV =
+            vec2(
+                ringPixel.x / 1090.0,
+                ringPixel.y / 976.0
+            );
+
+        if (
+            ringUV.x >= 0.0 && ringUV.x <= 1.0 &&
+            ringUV.y >= 0.0 && ringUV.y <= 1.0
+        ) {
+
+            result =
+                texture2D(uLogoTexture, ringUV);
+        }
+
+        /*
+         * Within the ring band, but possibly landed on a transparent
+         * gap between letters - still RING_ROTATED (result may just
+         * be transparent). Falling back to the static bake here would
+         * show an unrotated ghost of the letters underneath, which
+         * would look like a glitch once the two are out of sync.
+         */
+        return RING_ROTATED;
     }
 
 
@@ -422,7 +552,7 @@ const fragmentShader = /*glsl*/`
                 );
 
 
-            vec3 sample =
+            vec3 latticeSample =
                 vec3(
                     cos(latticeTheta) *
                     sinphi,
@@ -436,7 +566,7 @@ const fragmentShader = /*glsl*/`
 
             float dist =
                 length(
-                    p - sample
+                    p - latticeSample
                 );
 
 
@@ -448,7 +578,7 @@ const fragmentShader = /*glsl*/`
                     dist;
 
                 minip =
-                    sample;
+                    latticeSample;
 
             }
 
@@ -643,6 +773,35 @@ const fragmentShader = /*glsl*/`
                             uTexture,
                             texCoord
                         );
+
+
+                    /*
+                     * Laughing Man spinning text ring: try to override
+                     * textureColor with a rotated ring sample. Only on
+                     * the front side (the back side's contribution is
+                     * already faded down to a couple of percent by the
+                     * compositing below, so animating it too wouldn't
+                     * be visible - not worth doubling this work).
+                     */
+                    if (
+                        uAnimateRing > 0.5 &&
+                        side == 0
+                    ) {
+
+                        vec4 ringResult;
+                        int ringStatus = RING_MISS;
+
+                        ringStatus = sampleRingFace(rP, vec3(0.0, 1.0, 0.0), uRingAngle, ringResult);
+                        if (ringStatus == RING_MISS) ringStatus = sampleRingFace(rP, vec3(0.0, -1.0, 0.0), uRingAngle, ringResult);
+                        if (ringStatus == RING_MISS) ringStatus = sampleRingFace(rP, vec3(1.0, 0.0, 0.0), uRingAngle, ringResult);
+                        if (ringStatus == RING_MISS) ringStatus = sampleRingFace(rP, vec3(0.0, 0.0, 1.0), uRingAngle, ringResult);
+                        if (ringStatus == RING_MISS) ringStatus = sampleRingFace(rP, vec3(-1.0, 0.0, 0.0), uRingAngle, ringResult);
+                        if (ringStatus == RING_MISS) ringStatus = sampleRingFace(rP, vec3(0.0, 0.0, -1.0), uRingAngle, ringResult);
+
+                        if (ringStatus == RING_ROTATED) {
+                            textureColor = ringResult;
+                        }
+                    }
 
 
                     /*
