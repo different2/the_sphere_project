@@ -2256,10 +2256,6 @@ if (fileUpload) {
 // return to their starting values.
 // ============================================================
 
-const EXPORT_FRAME_COUNT = 129;
-const EXPORT_FRAME_DELAY_MS = 83;
-const EXPORT_SIZE = 480;
-
 const exportGifBtn =
     document.getElementById('exportGifBtn');
 
@@ -2272,7 +2268,67 @@ function nextAnimationFrame() {
         (resolve) => requestAnimationFrame(resolve)
     );
 }
+async function loadGifPalette(url) {
 
+    console.log('[GIF] Loading external palette:', url);
+
+    const img = new Image();
+
+    img.src = url;
+
+    await img.decode();
+
+    console.log(
+        '[GIF] Palette image loaded:',
+        img.width,
+        'x',
+        img.height
+    );
+
+    const canvas =
+        document.createElement('canvas');
+
+    canvas.width = 16;
+    canvas.height = 16;
+
+    const ctx =
+        canvas.getContext('2d', {
+            willReadFrequently: true
+        });
+
+    ctx.drawImage(img, 0, 0);
+
+    const data =
+        ctx.getImageData(
+            0,
+            0,
+            16,
+            16
+        ).data;
+
+    const palette = [];
+
+    for (let i = 0; i < 256; i++) {
+
+        palette.push([
+            data[i * 4],
+            data[i * 4 + 1],
+            data[i * 4 + 2]
+        ]);
+    }
+
+    console.log(
+        '[GIF] First 10 palette colors:',
+        palette.slice(0, 10)
+    );
+
+    console.log(
+        '[GIF] Total palette colors:',
+        palette.length
+    );
+
+    return palette;
+}
 // Reads back only the globe's bounding box (not the full canvas) at
 // EXPORT_SIZE resolution, flipping WebGL's bottom-up rows to normal
 // top-down image order.
@@ -2369,8 +2425,8 @@ async function exportLoopableGif() {
 
         // ~12 FPS.
         // 120 frames gives a 10-second animation.
-        const EXPORT_FRAME_COUNT = 120;
-        const EXPORT_FRAME_DELAY_MS = 83;
+        const EXPORT_FRAME_COUNT = 196;
+        const EXPORT_FRAME_DELAY_MS = 67;
 
         // ------------------------------------------------------------
         // Canvases
@@ -2389,6 +2445,8 @@ async function exportLoopableGif() {
             exportCanvas.getContext('2d', {
                 willReadFrequently: true
             });
+            exportCtx.imageSmoothingEnabled = true;
+            exportCtx.imageSmoothingQuality = 'high';
 
         // ------------------------------------------------------------
         // Store every rendered frame.
@@ -2468,6 +2526,77 @@ async function exportLoopableGif() {
                     canvas.width,
                     canvas.height
                 );
+                if (i === 0) {
+            if (i === 0) {
+
+    const debugCanvas =
+        document.createElement('canvas');
+
+    debugCanvas.width =
+        imageData.width;
+
+    debugCanvas.height =
+        imageData.height;
+
+    const debugCtx =
+        debugCanvas.getContext('2d');
+
+    debugCtx.putImageData(
+        imageData,
+        0,
+        0
+    );
+
+    debugCanvas.toBlob(
+        (blob) => {
+
+            const url =
+                URL.createObjectURL(blob);
+
+            const link =
+                document.createElement('a');
+
+            link.href = url;
+
+            link.download =
+                'debug-webgl-frame.png';
+
+            document.body.appendChild(link);
+
+            link.click();
+
+            document.body.removeChild(link);
+
+            setTimeout(
+                () => URL.revokeObjectURL(url),
+                1000
+            );
+
+        },
+        'image/png'
+    );
+}
+
+
+// ============================================================
+// Continue normal GIF export
+// ============================================================
+                    
+
+    console.log(
+        '[GIF] WebGL source:',
+        canvas.width,
+        'x',
+        canvas.height
+    );
+
+    console.log(
+        '[GIF] Crop:',
+        imageData.width,
+        'x',
+        imageData.height
+    );
+}
 
             cropCanvas.width =
                 imageData.width;
@@ -2540,7 +2669,7 @@ async function exportLoopableGif() {
                 'Building shared color palette...';
         }
 
-        const PIXEL_STRIDE = 4;
+        const PIXEL_STRIDE = 1;
 
         const sampledPixelCount =
             Math.ceil(
@@ -2594,13 +2723,14 @@ async function exportLoopableGif() {
         // ------------------------------------------------------------
 
         const palette =
-            quantize(
-                palettePixels,
-                256,
-                {
-                    format: 'rgb565'
-                }
-            );
+            await loadGifPalette('palette-diff.png');
+            // quantize(
+            //     palettePixels,
+            //     256,
+            //     {
+            //         format: 'rgb565'
+            //     }
+            // );
 
         // ------------------------------------------------------------
         // Create GIF encoder.
