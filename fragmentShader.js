@@ -422,7 +422,7 @@ const fragmentShader = /*glsl*/`
                 );
 
 
-            vec3 sample =
+            vec3 latticeSample =
                 vec3(
                     cos(latticeTheta) *
                     sinphi,
@@ -436,7 +436,7 @@ const fragmentShader = /*glsl*/`
 
             float dist =
                 length(
-                    p - sample
+                    p - latticeSample
                 );
 
 
@@ -448,7 +448,7 @@ const fragmentShader = /*glsl*/`
                     dist;
 
                 minip =
-                    sample;
+                    latticeSample;
 
             }
 

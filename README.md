@@ -8,6 +8,23 @@ texture or as a Fibonacci-lattice dot pattern.
 
 - **Texture** - Laughing Man (default), Earth Map, Text Message, or Upload
   Image.
+- **Laughing Man** now plays `assets/laughingman.gif` (with the text ring
+  already spinning, baked into its frames) through the exact same
+  animated-GIF pipeline as an upload - see "Needs your file" below, this
+  asset isn't in the project yet. Falls back to the static
+  `assets/laughingman.png` (no animation) if the GIF isn't present, so the
+  site works either way. Fetched, decoded and baked once, then cached for
+  the rest of the session, so switching back to it after visiting another
+  texture is instant.
+- **Upload Image** also accepts animated GIFs - drop one in and it
+  plays on the globe, looping on its own timing, at whatever Face Count is
+  selected. Every frame is decoded and prepared up front (with a brief
+  "Preparing frame N/M..." status) so playback itself is just switching
+  between ready-made textures - no per-frame decode/re-bake cost while
+  it's actually spinning. Long/high-fps GIFs are capped at 60 frames
+  (subsampled evenly) to keep that upfront step and GPU memory bounded.
+  Per-face override slots don't get their own independent animation - a
+  GIF dropped there just shows its first frame as a static image.
 - **Your text** *(Text Message mode)* - a full multi-line box now, not just
   one line. Type a paragraph and it word-wraps and auto-sizes to fit; each
   line becomes its own horizontal band/ring around the globe (top line
@@ -35,16 +52,44 @@ texture or as a Fibonacci-lattice dot pattern.
   size controls (unchanged).
 - **Export Loopable GIF** - renders the current globe (whatever
   texture/faces/dots/spin settings are active) as a seamlessly-looping,
-  transparent-background animated GIF and downloads it.
+  transparent-background animated GIF and downloads it. If an animated
+  GIF is currently uploaded, export captures whichever of its frames
+  happens to be showing at the moment you click Export, held static for
+  the whole export - it doesn't yet cycle the source GIF's own animation
+  during export (a reasonable follow-up if you want it, just not in this
+  round).
 
 ## Notes
 
+- **Needs your file:** this expects `assets/laughingman.gif` to exist and
+  doesn't have it yet - drop your file in at that exact path (or send it
+  over and I'll place it) and Laughing Man will animate. Until then it
+  runs the static-image fallback, same look as before any of this.
+- The shader-based ring rotation from the previous round (uniforms,
+  `sampleRingFace()`, the per-frame rebuild in `main()`) has been fully
+  removed from `fragmentShader.js` and `main.js` - it wasn't working
+  reliably, so rather than leave broken/unused code in place, Laughing
+  Man's animation is now entirely GIF-based, same mechanism as an
+  uploaded GIF. The one real fix that came out of that attempt (the
+  `sample` → `latticeSample` rename below) is kept; everything else from
+  it is gone.
 - The Earth Map preset's texture data is left exactly as-is in this round
   on request - if you're merging this in, re-apply your own fix to
   `textures.js` for it.
 - Face counts other than 1/2/3/4/6 aren't supported yet, but
   `getFaceCenters()` in `main.js` is the one place to extend if that's
   ever needed - everything else just asks it "how many faces and where."
+- Fixed a latent GLSL naming collision in `fragmentShader.js` (a local
+  variable was named `sample`, which some GLSL compilers treat as a
+  reserved word) - purely a rename, no behavior change.
+- **Flagged, not fixed:** `fragmentShader.js`'s `uv = uv * 1.0 - 1.0` (in
+  `main()`, computing the screen UV coordinates) looks like it should be
+  `* 2.0`, and this predates any of my changes - confirmed via `git diff`
+  against the original "adding laughing man" commit. With `* 1.0`, the
+  visible globe only occupies about a quarter of the frame, pushed into
+  one corner, instead of being centered - confirmed by actually compiling
+  and rendering the real shader through a headless WebGL context. Still
+  not touched, still out of scope unless you want it done.
 
 ## Project structure
 
@@ -53,4 +98,4 @@ texture or as a Fibonacci-lattice dot pattern.
 - `fragmentShader.js` - the sphere/dots/lighting shader.
 - `phenomenon.js` - small WebGL rendering helper library.
 - `textures.js` - built-in presets + the text-texture generator.
-- `vendor/` - a small vendored GIF encoder (see `vendor/README.md`).
+- `vendor/` - a vendored GIF encoder and decoder (see `vendor/README.md`).
