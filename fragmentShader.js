@@ -17,6 +17,13 @@ const fragmentShader = /*glsl*/`
     uniform float dark;
     uniform float opacity;
 
+    /*
+     * When > 0.5, image transparency is ignored - every texel renders
+     * fully opaque (the "Solid image" toggle). Lets logos/GIFs with
+     * transparent backgrounds fill their whole circular patch.
+     */
+    uniform float uIgnoreAlpha;
+
     uniform sampler2D uTexture;
 
     /*
@@ -817,10 +824,14 @@ const fragmentShader = /*glsl*/`
 
 
                     /*
-                     * Use the actual alpha from the PNG.
+                     * Use the actual alpha from the PNG - unless the
+                     * "Solid image" toggle is on, which treats every
+                     * texel as fully opaque.
                      */
                     float alpha =
-                        textureColor.a;
+                        uIgnoreAlpha > 0.5 ?
+                            1.0 :
+                            textureColor.a;
 
 
                     /*

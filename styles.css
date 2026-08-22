@@ -220,7 +220,7 @@ html, body {
             border-top: 1px solid rgba(255, 255, 255, 0.15);
         }
 
-        #exportGifBtn {
+        .export-group button {
             width: 100%;
             background: rgba(77, 166, 255, 0.25);
             color: white;
@@ -231,15 +231,40 @@ html, body {
             font-family: Arial, sans-serif;
             cursor: pointer;
             transition: background 0.15s ease-out;
+            margin-top: 4px;
         }
 
-        #exportGifBtn:hover:not(:disabled) {
+        .export-group button:hover:not(:disabled) {
             background: rgba(77, 166, 255, 0.45);
         }
 
-        #exportGifBtn:disabled {
+        .export-group button:disabled {
             opacity: 0.6;
             cursor: default;
+        }
+
+        /* Multi-sphere mode */
+        #sphereField {
+            position: fixed;
+            inset: 0;
+            z-index: 50;
+            display: none;
+            background: #000;
+        }
+
+        #sphereField.active {
+            display: block;
+        }
+
+        .field-sphere {
+            position: absolute;
+            border-radius: 50%;
+            cursor: pointer;
+            transition: box-shadow 0.2s ease-out;
+        }
+
+        .field-sphere:hover {
+            box-shadow: 0 0 24px rgba(120, 200, 255, 0.8);
         }
 
         .export-status {

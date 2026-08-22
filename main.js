@@ -13,6 +13,13 @@ import { GIFEncoder, quantize, applyPalette } from './vendor/gifenc.esm.js';
 // GIF decoder (vendored, see vendor/README.md)
 import { parseGIF, decompressFrames } from './vendor/gifuct.esm.js';
 
+// Multi-sphere field mode
+import {
+    openSphereField,
+    spawnSphereAt,
+    clearFieldSpheres
+} from './sphere-field.js';
+
 const vertexShader = `
 attribute vec3 aPosition;
 
@@ -65,6 +72,16 @@ let isPaused = false;
 // loop length.
 const PHI_RATE = 0.008;
 const THETA_RATE = 0.004;
+
+// User-controlled multiplier on both rates (Spin speed slider). 1 = the
+// original speed, 0 = effectively paused (without using Pause spin), >1
+// = faster. Exported GIFs use it too so exports match what's on screen.
+let spinSpeedMultiplier = 1.0;
+
+// Face size multiplier for custom images - scales every face's angular
+// patch without touching the sphere itself (Face Size slider). Applied
+// at bake/composite time via getAngularRadiusForFaceCount.
+let faceSizeMultiplier = 1.0;
 
 // Tracks what kind of custom content is currently active, so the Face
 // Count control knows what to regenerate from when it changes.
@@ -562,11 +579,19 @@ function getFaceCenters(faceCount) {
 // care what count it is.
 function getAngularRadiusForFaceCount(faceCount) {
 
-    if (faceCount === 2) return 45;
-    if (faceCount === 3) return 36;
-    if (faceCount === 4) return 32;
+    const base =
+        faceCount === 2 ? 45 :
+        faceCount === 3 ? 36 :
+        faceCount === 4 ? 32 :
+        28;
 
-    return 28;
+    // Face Size slider scales every patch. Clamped so patches can
+    // never grow past the hemisphere (cos 90° = 0) - beyond that the
+    // gnomonic projection degenerates.
+    return Math.min(
+        89,
+        base * faceSizeMultiplier
+    );
 }
 
 // ============================================================
@@ -2915,6 +2940,11 @@ async function createGlobe() {
                             0.8,
                             1.0
                         ]
+                    },
+
+                    uIgnoreAlpha: {
+                        type: "float",
+                        value: 0
                     }
 
                 },
@@ -3161,19 +3191,46 @@ function animate(timestamp) {
     // stay live and responsive), just stop auto-incrementing them.
     if (!isPaused) {
 
+        // Spin speed slider scales both rates; 0 = stationary.
         if (spinType === 'axis') {
 
             // Clean single-axis spin, like a globe on a stand. Theta
             // is left alone so the manual Theta slider still works
             // as a fixed tilt.
-            phi += PHI_RATE;
+            phi += PHI_RATE * spinSpeedMultiplier;
 
         } else {
 
             // Randomized/tumbling dual-axis spin (default/original
             // behavior).
-            phi += PHI_RATE;
-            theta += THETA_RATE;
+            phi += PHI_RATE * spinSpeedMultiplier;
+            theta += THETA_RATE * spinSpeedMultiplier;
+        }
+    }
+
+    // Drag interaction: direct rotation while dragging (handled by
+    // event handlers), plus flick momentum after release. Momentum
+    // decays geometrically so a flick throws the globe and it
+    // settles back toward its ambient spin.
+    if (!dragActive) {
+
+        if (
+            Math.abs(dragVelocityPhi) > 0.00001 ||
+            Math.abs(dragVelocityTheta) > 0.00001
+        ) {
+
+            applyDragDelta(
+                dragVelocityPhi / DRAG_SENSITIVITY,
+                dragVelocityTheta / DRAG_SENSITIVITY
+            );
+
+            dragVelocityPhi *= DRAG_VELOCITY_DECAY;
+            dragVelocityTheta *= DRAG_VELOCITY_DECAY;
+
+        } else {
+
+            dragVelocityPhi = 0;
+            dragVelocityTheta = 0;
         }
     }
 
@@ -3312,6 +3369,308 @@ if (scaleControl) {
                 );
 
         }
+    );
+}
+
+// ------------------------------------------------------------
+// Spin speed - multiplies both rotation rates live. 0 = stationary
+// (softer than the Pause checkbox, which also freezes slider edits).
+// The GIF exporter reads this too so exports match screen speed.
+// ------------------------------------------------------------
+const spinSpeedControl =
+    document.getElementById('spinSpeed');
+
+if (spinSpeedControl) {
+
+    spinSpeedMultiplier =
+        parseFloat(spinSpeedControl.value);
+
+    spinSpeedControl.addEventListener(
+        'input',
+        (e) => {
+
+            spinSpeedMultiplier =
+                parseFloat(e.target.value);
+
+        }
+    );
+}
+
+// ------------------------------------------------------------
+// Glow color - the atmosphere/edge glow tint. Hex -> [r,g,b] in 0..1,
+// applied to the glowColor uniform (shared by both shader modes).
+// ------------------------------------------------------------
+const glowColorControl =
+    document.getElementById('glowColor');
+
+if (glowColorControl) {
+
+    function hexToRgb01(hex) {
+
+        const r = parseInt(hex.slice(1, 3), 16) / 255;
+        const g = parseInt(hex.slice(3, 5), 16) / 255;
+        const b = parseInt(hex.slice(5, 7), 16) / 255;
+
+        return [r, g, b];
+    }
+
+    glowColorControl.addEventListener(
+        'input',
+        (e) => {
+
+            if (instance && instance.uniforms.glowColor) {
+                instance.uniforms.glowColor.value =
+                    hexToRgb01(e.target.value);
+            }
+
+        }
+    );
+}
+
+// ------------------------------------------------------------
+// Opacity - overall globe transparency, straight through to the
+// existing uniform.
+// ------------------------------------------------------------
+const opacityControl =
+    document.getElementById('opacity');
+
+if (opacityControl) {
+
+    opacityControl.addEventListener(
+        'input',
+        (e) => {
+
+            if (instance && instance.uniforms.opacity) {
+                instance.uniforms.opacity.value =
+                    parseFloat(e.target.value);
+            }
+
+        }
+    );
+}
+
+// ------------------------------------------------------------
+// "Solid image" - ignore image transparency so logos/GIFs with alpha
+// render as filled discs instead of cutouts. Straight to the shader.
+// ------------------------------------------------------------
+const ignoreAlphaToggle =
+    document.getElementById('ignoreAlphaToggle');
+
+if (ignoreAlphaToggle) {
+
+    if (instance && instance.uniforms.uIgnoreAlpha) {
+        instance.uniforms.uIgnoreAlpha.value =
+            ignoreAlphaToggle.checked ? 1 : 0;
+    }
+
+    ignoreAlphaToggle.addEventListener(
+        'change',
+        (e) => {
+
+            if (instance && instance.uniforms.uIgnoreAlpha) {
+                instance.uniforms.uIgnoreAlpha.value =
+                    e.target.checked ? 1 : 0;
+            }
+
+        }
+    );
+}
+
+// ------------------------------------------------------------
+// Face size - scales the angular radius of every custom-image face.
+// Visible only when the per-face UI is relevant; any change re-derives
+// whatever is currently active (CPU bake or shader composite).
+// ------------------------------------------------------------
+const faceSizeControl =
+    document.getElementById('faceSize');
+const faceSizeGroup =
+    document.getElementById('faceSizeGroup');
+
+if (faceSizeControl) {
+
+    faceSizeMultiplier =
+        parseFloat(faceSizeControl.value);
+
+    faceSizeControl.addEventListener(
+        'input',
+        (e) => {
+
+            faceSizeMultiplier =
+                parseFloat(e.target.value);
+
+            // Re-derive the active content at the new patch size -
+            // cheap for the composite path (uniforms only), heavier
+            // for CPU-baked paths but only while dragging.
+            if (faceCompositeActive) {
+
+                updateFaceComposite();
+
+            } else if (
+                activeCustomKind === 'image' &&
+                rawCustomImages[0]
+            ) {
+
+                regenerateCustomImageTexture();
+
+            } else if (rawGifFrames) {
+
+                rebakeAnimatedGifFrames();
+            }
+        }
+    );
+
+    // Show alongside the other image controls whenever an upload /
+    // multi-face layout makes sense.
+    const syncFaceSizeVisibility = () => {
+
+        if (!faceSizeGroup) {
+            return;
+        }
+
+        const show =
+            activeCustomKind === 'image';
+
+        faceSizeGroup.style.display =
+            show ? 'block' : 'none';
+    };
+
+    // Hook into texture selection changes by observing the group's
+    // own visibility toggles - simplest reliable sync point.
+    new MutationObserver(syncFaceSizeVisibility)
+        .observe(document.getElementById('faceCountGroup'), {
+            attributes: true,
+            attributeFilter: ['style']
+        });
+
+    syncFaceSizeVisibility();
+}
+
+// ============================================================
+// Drag-to-spin (mouse + touch)
+//
+// Dragging on the globe canvas rotates the sphere directly: horizontal
+// drag -> phi, vertical drag -> theta. Works whether spinning or
+// paused - while paused the drag edits phi/theta like the sliders do;
+// while spinning it adds velocity that decays back to the ambient
+// spin, so a flick "throws" the globe and it gradually settles back
+// into its normal rotation.
+// ============================================================
+
+let dragActive = false;
+let dragLastX = 0;
+let dragLastY = 0;
+
+// Flick momentum, in radians per frame. Decays each tick while the
+// user isn't dragging.
+let dragVelocityPhi = 0;
+let dragVelocityTheta = 0;
+
+const DRAG_SENSITIVITY = 0.008;
+const DRAG_VELOCITY_DECAY = 0.95;
+
+function dragStart(x, y) {
+
+    dragActive = true;
+    dragLastX = x;
+    dragLastY = y;
+
+    // Grabbing kills any in-flight flick so it doesn't fight you.
+    dragVelocityPhi = 0;
+    dragVelocityTheta = 0;
+}
+
+function dragMove(x, y) {
+
+    if (!dragActive) {
+        return;
+    }
+
+    const dx = x - dragLastX;
+    const dy = y - dragLastY;
+
+    dragLastX = x;
+    dragLastY = y;
+
+    applyDragDelta(dx, dy);
+
+    // Track recent motion for the flick-on-release effect.
+    dragVelocityPhi =
+        dx * DRAG_SENSITIVITY;
+
+    dragVelocityTheta =
+        dy * DRAG_SENSITIVITY;
+}
+
+function dragEnd() {
+    dragActive = false;
+}
+
+function applyDragDelta(dx, dy) {
+
+    phi += dx * DRAG_SENSITIVITY;
+    theta += dy * DRAG_SENSITIVITY;
+}
+
+const globeCanvas = document.getElementById('globe');
+
+if (globeCanvas) {
+
+    // Mouse
+    globeCanvas.addEventListener(
+        'mousedown',
+        (e) => {
+
+            dragStart(e.clientX, e.clientY);
+
+            e.preventDefault();
+        }
+    );
+
+    window.addEventListener(
+        'mousemove',
+        (e) => {
+
+            if (dragActive) {
+                dragMove(e.clientX, e.clientY);
+            }
+        }
+    );
+
+    window.addEventListener(
+        'mouseup',
+        dragEnd
+    );
+
+    // Touch (single finger; passive:false so the page doesn't scroll)
+    globeCanvas.addEventListener(
+        'touchstart',
+        (e) => {
+
+            const touch = e.touches[0];
+
+            dragStart(touch.clientX, touch.clientY);
+
+            e.preventDefault();
+        },
+        { passive: false }
+    );
+
+    globeCanvas.addEventListener(
+        'touchmove',
+        (e) => {
+
+            const touch = e.touches[0];
+
+            dragMove(touch.clientX, touch.clientY);
+
+            e.preventDefault();
+        },
+        { passive: false }
+    );
+
+    globeCanvas.addEventListener(
+        'touchend',
+        dragEnd
     );
 }
 
@@ -4583,6 +4942,332 @@ if (exportGifBtn) {
         () => {
 
             exportLoopableGif();
+
+        }
+    );
+}
+
+// ============================================================
+// WebM video export
+//
+// Same seamless one-rotation loop as the GIF export, but recorded
+// through MediaRecorder: full-color (no 256-color quantization), any
+// resolution the live canvas offers, and smooth timing - the things a
+// GIF structurally can't do. Good for screensavers / video edits.
+// VP9 is preferred when the browser offers it, VP8 otherwise.
+// ============================================================
+
+const EXPORT_VIDEO_SECONDS = 6;
+const EXPORT_VIDEO_SIZE = 1080;
+
+const exportWebmBtn =
+    document.getElementById('exportWebmBtn');
+
+// ------------------------------------------------------------
+// Sphere Field mode - full-screen surface with many independent
+// spheres (see sphere-field.js). The main sidebar keeps controlling
+// the primary globe underneath.
+// ------------------------------------------------------------
+const sphereFieldBtn =
+    document.getElementById('sphereFieldBtn');
+
+if (sphereFieldBtn) {
+
+    sphereFieldBtn.addEventListener(
+        'click',
+        () => {
+
+            openSphereField();
+
+            // Seed the field with a small starter cluster so it
+            // doesn't open empty - users add more by double-clicking
+            // empty space, or drag images straight onto a sphere.
+            const w = window.innerWidth;
+            const h = window.innerHeight;
+
+            spawnSphereAt(w * 0.3, h * 0.4, 170);
+            spawnSphereAt(w * 0.55, h * 0.6, 130);
+            spawnSphereAt(w * 0.72, h * 0.35, 100);
+        }
+    );
+}
+
+async function exportLoopableWebm() {
+
+    if (
+        !p ||
+        !p.gl ||
+        !instance ||
+        isExportingGif
+    ) {
+        return;
+    }
+
+    // MediaRecorder + canvas.captureStream are required.
+    if (
+        typeof MediaRecorder === 'undefined' ||
+        !canvas.captureStream
+    ) {
+
+        if (exportStatus) {
+            exportStatus.textContent =
+                'Video export not supported in this browser.';
+        }
+
+        return;
+    }
+
+    // Pick the best available codec.
+    const candidates = [
+        { mime: 'video/webm;codecs=vp9', ext: 'vp9' },
+        { mime: 'video/webm;codecs=vp8', ext: 'vp8' },
+        { mime: 'video/webm', ext: 'default' }
+    ];
+
+    const chosen =
+        candidates.find(
+            c => MediaRecorder.isTypeSupported(c.mime)
+        );
+
+    if (!chosen) {
+
+        if (exportStatus) {
+            exportStatus.textContent =
+                'No WebM codec available in this browser.';
+        }
+
+        return;
+    }
+
+    isExportingGif = true;
+
+    // Reuse the GIF button guard too - only one export at a time.
+    if (exportGifBtn) {
+        exportGifBtn.disabled = true;
+    }
+
+    if (exportWebmBtn) {
+        exportWebmBtn.disabled = true;
+    }
+
+    const startPhi = phi;
+    const startTheta = theta;
+
+    try {
+
+        if (exportStatus) {
+            exportStatus.textContent = 'Preparing video...';
+        }
+
+        // ----------------------------------------------------
+        // Render the loop into an offscreen canvas at fixed square
+        // size (same crop logic as the GIF path), and record THAT -
+        // keeps output independent of window size/DPI.
+        // ----------------------------------------------------
+
+        const exportCanvas =
+            document.createElement('canvas');
+
+        exportCanvas.width = EXPORT_VIDEO_SIZE;
+        exportCanvas.height = EXPORT_VIDEO_SIZE;
+
+        const exportCtx =
+            exportCanvas.getContext('2d');
+
+        exportCtx.imageSmoothingEnabled = true;
+        exportCtx.imageSmoothingQuality = 'high';
+
+        const cropCanvas =
+            document.createElement('canvas');
+
+        const stream =
+            exportCanvas.captureStream(60);
+
+        const recorder =
+            new MediaRecorder(stream, {
+                mimeType: chosen.mime,
+                videoBitsPerSecond: 12_000_000
+            });
+
+        const chunks = [];
+
+        recorder.ondataavailable =
+            (e) => {
+
+                if (e.data && e.data.size > 0) {
+                    chunks.push(e.data);
+                }
+            };
+
+        const done = new Promise((resolve) => {
+            recorder.onstop = resolve;
+        });
+
+        recorder.start();
+
+        const totalMs = EXPORT_VIDEO_SECONDS * 1000;
+        const startWallClock = performance.now();
+
+        let frameIndex = 0;
+
+        // Drive frames manually on rAF - deterministic rotation over
+        // exactly N seconds, ending where it started (full turns).
+        while (performance.now() - startWallClock < totalMs) {
+
+            const elapsed =
+                performance.now() - startWallClock;
+
+            const progress =
+                elapsed / totalMs;
+
+            if (exportStatus) {
+                exportStatus.textContent =
+                    `Recording video ${(progress * 100).toFixed(0)}%...`;
+            }
+
+            const t =
+                progress * Math.PI * 2 *
+                (spinSpeedMultiplier || 1);
+
+            let framePhi;
+            let frameTheta;
+
+            if (spinType === 'axis') {
+
+                framePhi = startPhi + t;
+                frameTheta = startTheta;
+
+            } else {
+
+                frameTheta = startTheta + t;
+                framePhi = startPhi + t * 2;
+            }
+
+            instance.render({
+                ...p.uniforms,
+                phi: { type: "float", value: framePhi },
+                theta: { type: "float", value: frameTheta },
+                dots: { type: "float", value: dots },
+                scale: { type: "float", value: scale },
+                uUseDots: { type: "float", value: useDots }
+            });
+
+            const imageData =
+                readGlobeCropAsImageData(
+                    p.gl,
+                    canvas.width,
+                    canvas.height
+                );
+
+            cropCanvas.width = imageData.width;
+            cropCanvas.height = imageData.height;
+
+            cropCanvas
+                .getContext('2d')
+                .putImageData(imageData, 0, 0);
+
+            exportCtx.clearRect(
+                0, 0, EXPORT_VIDEO_SIZE, EXPORT_VIDEO_SIZE
+            );
+
+            // Transparent background -> composite onto black for
+            // video (no alpha channel in WebM).
+            exportCtx.fillStyle = '#000';
+            exportCtx.fillRect(
+                0, 0, EXPORT_VIDEO_SIZE, EXPORT_VIDEO_SIZE
+            );
+
+            exportCtx.drawImage(
+                cropCanvas,
+                0, 0, imageData.width, imageData.height,
+                0, 0, EXPORT_VIDEO_SIZE, EXPORT_VIDEO_SIZE
+            );
+
+            frameIndex++;
+
+            await nextAnimationFrame();
+        }
+
+        recorder.stop();
+
+        await done;
+
+        const blob =
+            new Blob(chunks, { type: 'video/webm' });
+
+        const url =
+            URL.createObjectURL(blob);
+
+        const link =
+            document.createElement('a');
+
+        link.href = url;
+        link.download = `globe-loop-${EXPORT_VIDEO_SIZE}p.webm`;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+
+        setTimeout(
+            () => URL.revokeObjectURL(url),
+            10000
+        );
+
+        if (exportStatus) {
+            exportStatus.textContent =
+                `Done! ${frameIndex} frames (${(blob.size / 1024 / 1024).toFixed(1)} MB)`;
+
+            setTimeout(
+                () => {
+                    if (exportStatus) {
+                        exportStatus.textContent = '';
+                    }
+                },
+                4000
+            );
+        }
+
+        console.log(
+            `WebM export complete: ${frameIndex} frames, ${(blob.size / 1024 / 1024).toFixed(1)} MB`
+        );
+
+    } catch (error) {
+
+        console.error(
+            "WebM export failed:",
+            error
+        );
+
+        if (exportStatus) {
+            exportStatus.textContent =
+                'Video export failed - see console.';
+        }
+
+    } finally {
+
+        phi = startPhi;
+        theta = startTheta;
+
+        bindActiveAnimatedFrame();
+
+        isExportingGif = false;
+
+        if (exportGifBtn) {
+            exportGifBtn.disabled = false;
+        }
+
+        if (exportWebmBtn) {
+            exportWebmBtn.disabled = false;
+        }
+    }
+}
+
+if (exportWebmBtn) {
+
+    exportWebmBtn.addEventListener(
+        'click',
+        () => {
+
+            exportLoopableWebm();
 
         }
     );
