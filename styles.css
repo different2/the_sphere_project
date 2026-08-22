@@ -1,4 +1,4 @@
-    html, body {
+html, body {
             margin: 0;
             padding: 0;
             background: #000;
@@ -177,6 +177,7 @@
         }
 
         .face-slot-thumb {
+            position: relative;
             width: 28px;
             height: 28px;
             padding: 0;
@@ -200,6 +201,17 @@
 
         .face-slot-thumb.is-override {
             border-color: #4da6ff;
+        }
+
+        .face-slot-number {
+            position: absolute;
+            bottom: 1px;
+            right: 2px;
+            font-size: 9px;
+            line-height: 1;
+            color: rgba(255, 255, 255, 0.95);
+            text-shadow: 0 0 2px #000, 0 0 3px #000;
+            pointer-events: none;
         }
 
         .export-group {

@@ -25,6 +25,44 @@ const fragmentShader = /*glsl*/`
      */
     uniform float uUseDots;
 
+    /*
+     * 1.0 = per-face composite mode: each of up to 6 globe "faces"
+     * carries its OWN texture (an animated GIF's current frame or a
+     * static image), composited live here with the same gnomonic
+     * tangent-plane projection generateGlobeTexture() uses when
+     * pre-baking the CPU-side composite - except per-face, which is
+     * what lets every face animate independently.
+     */
+    uniform float uUseFaces;
+
+    uniform float uFaceCountF;
+
+    uniform vec3 uFaceCenter[6];
+
+    uniform vec3 uFaceEast[6];
+
+    uniform vec3 uFaceNorth[6];
+
+    /*
+     * Per face: x = cos(angular radius), y = 1/(logoScale*width),
+     * z = 1/(logoScale*height), w unused. logoScale matches the CPU
+     * baker: halfSize / (max(width,height)/2).
+     */
+    uniform vec4 uFaceParams[6];
+
+    /* Face i is sampled on texture unit i. */
+    uniform sampler2D uFaceTex0;
+
+    uniform sampler2D uFaceTex1;
+
+    uniform sampler2D uFaceTex2;
+
+    uniform sampler2D uFaceTex3;
+
+    uniform sampler2D uFaceTex4;
+
+    uniform sampler2D uFaceTex5;
+
 
     const float sqrt5 = 2.23606797749979;
 
@@ -464,6 +502,132 @@ const fragmentShader = /*glsl*/`
 
 
     // ========================================================
+    // Per-face gnomonic composite
+    // ========================================================
+
+    /*
+     * GLSL port of generateGlobeTexture()'s per-pixel loop: for the
+     * surface direction rP, find the first face whose angular patch
+     * contains it, project onto that face's tangent plane (gnomonic),
+     * map to the face image's pixel coordinates, and sample. Faces
+     * with no content of their own sample whichever slot the CPU side
+     * designated as the fallback (passed in .w) - matching
+     * rawCustomImages[i] || rawCustomImages[0] in the CPU bake.
+     * Returns transparent black when no face covers this point.
+     */
+    vec4 sampleFaceComposite(vec3 rP) {
+
+        for (int i = 0; i < 6; i++) {
+
+            if (float(i) >= uFaceCountF) {
+                break;
+            }
+
+            // .w carries WHICH texture unit this face samples - its
+            // own slot when it has an override, otherwise the CPU's
+            // designated fallback slot.
+            int texSlot =
+                int(uFaceParams[i].w + 0.5);
+
+            vec3 center =
+                uFaceCenter[i];
+
+            float centerDot =
+                dot(rP, center);
+
+            if (centerDot <= 0.0) {
+                continue;
+            }
+
+            float angleCos =
+                clamp(
+                    centerDot,
+                    0.0,
+                    1.0
+                );
+
+            // Patch membership via cosine, mirroring
+            // acos(angle) > radiusRad on the CPU.
+            if (angleCos < uFaceParams[i].x) {
+                continue;
+            }
+
+            vec3 tangent =
+                vec3(
+                    dot(rP, uFaceEast[i]),
+                    dot(rP, uFaceNorth[i]),
+                    centerDot
+                )
+                / centerDot;
+
+            // logoScale = halfSize / logoRadius, so dividing by
+            // logoScale scales the tangent unit circle out to the
+            // image's pixel dimensions - see the CPU baker.
+            float invScaleX =
+                uFaceParams[i].y;
+
+            float invScaleY =
+                uFaceParams[i].z;
+
+            float lx =
+                tangent.x * invScaleX +
+                0.5;
+
+            float ly =
+                0.5 -
+                tangent.y * invScaleY;
+
+            if (
+                lx < 0.0 ||
+                ly < 0.0 ||
+                lx >= 1.0 ||
+                ly >= 1.0
+            ) {
+                continue;
+            }
+
+            vec4 sampled;
+
+            if (texSlot == 0) {
+
+                sampled =
+                    texture2D(uFaceTex0, vec2(lx, ly));
+
+            } else if (texSlot == 1) {
+
+                sampled =
+                    texture2D(uFaceTex1, vec2(lx, ly));
+
+            } else if (texSlot == 2) {
+
+                sampled =
+                    texture2D(uFaceTex2, vec2(lx, ly));
+
+            } else if (texSlot == 3) {
+
+                sampled =
+                    texture2D(uFaceTex3, vec2(lx, ly));
+
+            } else if (texSlot == 4) {
+
+                sampled =
+                    texture2D(uFaceTex4, vec2(lx, ly));
+
+            } else {
+
+                sampled =
+                    texture2D(uFaceTex5, vec2(lx, ly));
+            }
+
+            if (sampled.a > 0.0) {
+                return sampled;
+            }
+        }
+
+        return vec4(0.0);
+    }
+
+    // ========================================================
     // Main
     // ========================================================
 
@@ -637,12 +801,19 @@ const fragmentShader = /*glsl*/`
 
                         );
 
+                    if (uUseFaces > 0.5) {
 
-                    textureColor =
-                        texture2D(
-                            uTexture,
-                            texCoord
-                        );
+                        textureColor =
+                            sampleFaceComposite(rP);
+
+                    } else {
+
+                        textureColor =
+                            texture2D(
+                                uTexture,
+                                texCoord
+                            );
+                    }
 
 
                     /*

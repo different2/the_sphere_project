@@ -82,6 +82,36 @@ let rawCustomImages = {};
 // highest value in the Face Count radio group.
 const MAX_FACE_SLOTS = 6;
 
+// ============================================================
+// Independent per-face animation (shader-composited mode)
+//
+// Each per-face slot can hold its OWN animated GIF - decoded once,
+// uploaded as one WebGL texture per frame, and advanced on its own
+// timer inside animate(). The fragment shader composites all six
+// face textures live (sampleFaceComposite), so no per-frame CPU
+// rebake is needed and every face animates independently.
+//
+// faceSlotContent[i] = {
+//   kind: 'gif' | 'image',
+//   frames: [{texture, delay}]   - gif: baked frame textures
+//   image: <img>                 - image: static source
+//   texture: <WebGLTexture>      - image: uploaded texture
+//   width, height,               - source dimensions (for logoScale)
+//   frameIndex, elapsedMs        - gif playback state
+// }
+//
+// While this mode is active, uUseFaces=1 and the shader does the
+// compositing; the CPU-baked uTexture path is untouched for every
+// other texture source. The choose-file pipeline routes GIFs into
+// slot 0 of this system when the per-face UI is visible (so a GIF
+// chosen either way plays animated), otherwise it keeps using the
+// classic whole-globe bake pipeline unchanged.
+// ============================================================
+
+const faceSlotContent = {};
+
+let faceCompositeActive = false;
+
 let isExportingGif = false;
 
 // ============================================================
@@ -95,11 +125,9 @@ let isExportingGif = false;
 // bound, on a timer matching the GIF's own per-frame delays, so
 // there's no per-frame decoding/baking cost during playback.
 //
-// Per-face override slots are untouched by any of this - selecting a
-// GIF there just shows its first frame as a static image (the natural
-// result of loading it into a plain <img>), which seemed like a
-// reasonable, simple default rather than adding a second independent
-// animation stream per face.
+// Per-face override slots have their OWN animation system (see
+// faceSlotContent above) - a GIF picked through a per-face button
+// animates independently on that face, composited live in the shader.
 // ============================================================
 
 // Bake resolution for GIF frames - smaller than the 2048 used for
@@ -143,6 +171,29 @@ let animatedGifElapsedMs = 0;
 let lastAnimationTimestamp = null;
 
 let isProcessingGif = false;
+
+// Monotonically-increasing counter representing "the current
+// texture-loading intent". Several texture-loading paths are async
+// (fetching/decoding a GIF, waiting for an <img> to decode) and yield
+// control while they work, so the person can switch to a different
+// texture before an earlier one finishes. Each such path captures
+// this value when it starts and checks it's unchanged before actually
+// updating what's displayed - if it's changed, something newer has
+// since been requested, so the update is skipped (the work already
+// done may still be cached, depending on the path) rather than
+// clobbering whatever's since been chosen. Without this, e.g.
+// selecting Earth right after the page loads could still get silently
+// overridden a moment later when Laughing Man's own background load
+// finishes and unconditionally rebinds itself.
+let loadGeneration = 0;
+
+// The name of the last file chosen via the main upload <input>, kept
+// purely for display (see showUploadStatusIdle below). The <input>'s
+// own value gets reset to '' right after each file is read so the
+// SAME file can be re-selected later - which also reverts its native
+// "No file chosen" text, so uploadStatus is used to show the actual
+// last-chosen filename instead.
+let lastUploadedFileName = null;
 
 // ============================================================
 // Canvas resizing
@@ -221,6 +272,14 @@ function createTexture(gl, imageData) {
                     `Loading image: ${image.width}x${image.height}`
                 );
 
+                // See uploadCanvasAsTexture for why this is saved and
+                // restored rather than just unbinding to null - this
+                // function is async (waits for the Image to load), so
+                // something else may be actively relying on whatever
+                // is currently bound by the time this callback runs.
+                const previousBinding =
+                    gl.getParameter(gl.TEXTURE_BINDING_2D);
+
                 const texture =
                     gl.createTexture();
 
@@ -280,7 +339,7 @@ function createTexture(gl, imageData) {
 
                     gl.bindTexture(
                         gl.TEXTURE_2D,
-                        null
+                        previousBinding
                     );
 
                     gl.deleteTexture(texture);
@@ -292,7 +351,7 @@ function createTexture(gl, imageData) {
 
                 gl.bindTexture(
                     gl.TEXTURE_2D,
-                    null
+                    previousBinding
                 );
 
                 console.log(
@@ -1011,6 +1070,11 @@ async function loadTexture(
         return;
     }
 
+    loadGeneration++;
+
+    const myGeneration =
+        loadGeneration;
+
     try {
 
         console.log(
@@ -1022,6 +1086,20 @@ async function loadTexture(
                 p.gl,
                 textureData
             );
+
+        if (myGeneration !== loadGeneration) {
+
+            // A newer texture request came in while this one was
+            // still loading - don't touch the display, and free this
+            // now-unneeded texture rather than leaking it.
+            p.gl.deleteTexture(texture);
+
+            console.log(
+                "Texture finished loading but a newer one was requested in the meantime - discarding"
+            );
+
+            return;
+        }
 
         p.gl.activeTexture(
             p.gl.TEXTURE0
@@ -1095,6 +1173,55 @@ function bindActiveAnimatedFrame() {
 // is ever missing.
 // ============================================================
 
+// ============================================================
+// Quick check for whether a decoded GIF frame has any meaningful
+// transparency, sampling a subset of pixels rather than the whole
+// canvas for speed. Some GIFs (including the bundled Laughing Man
+// asset) encode frame 0 as a complete, fully-opaque reference image
+// with NO transparency, only using proper alpha from frame 1 onward -
+// see loadLaughingMan, which uses this to avoid picking such a frame
+// as the quick preview.
+// ============================================================
+
+function hasUsableTransparency(canvas) {
+
+    const ctx = canvas.getContext('2d');
+
+    const { width, height } = canvas;
+
+    const data =
+        ctx.getImageData(0, 0, width, height).data;
+
+    const totalPixels = width * height;
+
+    const sampleStride =
+        Math.max(
+            1,
+            Math.floor(totalPixels / 2000)
+        );
+
+    let transparent = 0;
+    let sampled = 0;
+
+    for (
+        let i = 0;
+        i < totalPixels;
+        i += sampleStride
+    ) {
+
+        sampled++;
+
+        if (data[i * 4 + 3] < 128) {
+            transparent++;
+        }
+    }
+
+    return (
+        sampled > 0 &&
+        (transparent / sampled) > 0.05
+    );
+}
+
 async function loadLaughingMan() {
 
     if (!p || !p.gl) {
@@ -1107,6 +1234,11 @@ async function loadLaughingMan() {
     }
 
     setUseDots(false);
+
+    loadGeneration++;
+
+    const myGeneration =
+        loadGeneration;
 
     if (laughingManFrames) {
 
@@ -1142,63 +1274,205 @@ async function loadLaughingMan() {
         const arrayBuffer =
             await response.arrayBuffer();
 
-        let frames =
-            decodeGifFrames(arrayBuffer);
+        // ----------------------------------------------------
+        // Bake + bind an early frame as soon as a good one is
+        // decoded, and return right after - createGlobe() awaits this
+        // whole function before starting the live animation loop, so
+        // previously the canvas stayed blank until the ENTIRE GIF was
+        // both decoded AND baked (measured 12+ seconds for this asset
+        // - decoding alone, not baking, turned out to be the dominant
+        // cost). Decoding runs in small batches (see
+        // decodeGifFramesProgressive) so the page stays responsive
+        // throughout. Every frame still gets decoded/composited in
+        // order (needed for correct GIF disposal handling across the
+        // sequence) but only the ones kept after MAX_GIF_FRAMES
+        // subsampling get the pricier texture bake. Everything after
+        // the preview frame happens in the background (see the
+        // .then() chain) without being awaited here, appended to the
+        // SAME array laughingManFrames/activeAnimatedFrames already
+        // point to - animate() re-reads .length every tick, so it
+        // naturally starts including them as they arrive.
+        //
+        // The preview frame is deliberately NOT always frame 0: some
+        // GIFs (this one included) encode frame 0 as a complete,
+        // fully-OPAQUE reference image with no transparency at all,
+        // relying on later frames (which use proper alpha) for the
+        // actual intended look - fine as one brief instant in a
+        // looping animation, but jarring as the very first (and for a
+        // moment, only) thing shown. hasUsableTransparency skips past
+        // that kind of frame for preview purposes; every frame still
+        // gets baked and included, in order, for the real playback.
+        // ----------------------------------------------------
 
-        if (frames.length === 0) {
-            throw new Error(
-                "Laughing Man GIF has no frames"
-            );
-        }
+        const angularRadius =
+            getAngularRadiusForFaceCount(6);
 
-        if (frames.length > MAX_GIF_FRAMES) {
+        const bakedFrames = [];
 
-            const step =
-                frames.length / MAX_GIF_FRAMES;
+        let resolveFirstFrame;
+        let rejectFirstFrame;
 
-            const sampled = [];
+        const firstFrameReady = new Promise(
+            (resolve, reject) => {
+                resolveFirstFrame = resolve;
+                rejectFirstFrame = reject;
+            }
+        );
 
-            for (let i = 0; i < MAX_GIF_FRAMES; i++) {
+        let keepIndices = null;
 
-                sampled.push(
-                    frames[Math.floor(i * step)]
-                );
+        function shouldKeep(index, total) {
+
+            if (!keepIndices) {
+
+                const keepCount =
+                    Math.min(total, MAX_GIF_FRAMES);
+
+                const step = total / keepCount;
+
+                keepIndices = new Set();
+
+                for (let i = 0; i < keepCount; i++) {
+                    keepIndices.add(Math.floor(i * step));
+                }
+
+                if (total > MAX_GIF_FRAMES) {
+
+                    console.log(
+                        `Laughing Man GIF has ${total} frames, subsampled to ${MAX_GIF_FRAMES}`
+                    );
+                }
             }
 
-            console.log(
-                `Laughing Man GIF has ${frames.length} frames, subsampled to ${MAX_GIF_FRAMES}`
-            );
-
-            frames = sampled;
+            return keepIndices.has(index);
         }
 
-        laughingManFrames =
-            await bakeFramesToTextures(
-                frames,
-                6,
-                (i, total) => {
+        // Don't hold out for a transparent frame forever - a GIF with
+        // no transparency at all (e.g. a plain photo sequence) is
+        // completely valid, so after this many kept-and-baked frames
+        // the preview shows whatever's baked so far regardless.
+        const MAX_PREVIEW_LOOKAHEAD = 5;
 
-                    if (uploadStatus) {
+        let previewShown = false;
 
-                        uploadStatus.textContent =
-                            `Preparing Laughing Man frame ${i + 1}/${total}...`;
+        const decodePromise =
+            decodeGifFramesProgressive(
+                arrayBuffer,
+                (frame, index, total) => {
+
+                    if (!shouldKeep(index, total)) {
+                        return;
+                    }
+
+                    const baked =
+                        generateGlobeTexture(
+                            frame.canvas,
+                            angularRadius,
+                            GIF_BAKE_TEX_WIDTH,
+                            6
+                        );
+
+                    const texture =
+                        uploadCanvasAsTexture(p.gl, baked);
+
+                    bakedFrames.push({
+                        texture,
+                        delay: frame.delay
+                    });
+
+                    const readyForPreview =
+                        !previewShown &&
+                        (
+                            hasUsableTransparency(frame.canvas) ||
+                            bakedFrames.length >= MAX_PREVIEW_LOOKAHEAD
+                        );
+
+                    if (readyForPreview) {
+
+                        previewShown = true;
+
+                        // Always cache, regardless of whether this is
+                        // still the active selection - if the person
+                        // switches back to Laughing Man later, it
+                        // should be ready (or further along) rather
+                        // than starting over.
+                        laughingManFrames = bakedFrames;
+
+                        if (myGeneration === loadGeneration) {
+
+                            activeAnimatedFrames = bakedFrames;
+
+                            // Point at the frame that just qualified
+                            // (most recently pushed), not necessarily
+                            // index 0 - see the note above.
+                            animatedGifFrameIndex =
+                                bakedFrames.length - 1;
+
+                            animatedGifElapsedMs = 0;
+
+                            bindActiveAnimatedFrame();
+
+                            if (uploadStatus) {
+                                uploadStatus.textContent = '';
+                            }
+
+                            console.log(
+                                `Laughing Man preview ready (frame ${index}) - decoding/baking the rest in the background`
+                            );
+
+                        } else {
+
+                            console.log(
+                                `Laughing Man preview ready (frame ${index}) but a different texture is now selected - caching in the background without changing the display`
+                            );
+                        }
+
+                        resolveFirstFrame();
                     }
                 }
             );
 
-        activeAnimatedFrames = laughingManFrames;
-        animatedGifFrameIndex = 0;
-        animatedGifElapsedMs = 0;
+        // Fire-and-forget: intentionally not awaited here, so this
+        // function returns as soon as the preview frame is ready (see
+        // above).
+        decodePromise.then(() => {
 
-        bindActiveAnimatedFrame();
+            // Safety net: resolves firstFrameReady even if the GIF
+            // turned out to have zero usable frames (onFrame was
+            // never called) - the empty-frames check right below then
+            // handles that case the same way it always has. A no-op
+            // if the preview already resolved this above.
+            resolveFirstFrame();
 
-        if (uploadStatus) {
-            uploadStatus.textContent = '';
+            console.log(
+                `Laughing Man loaded: ${bakedFrames.length} frame(s)`
+            );
+
+        }).catch((error) => {
+
+            if (bakedFrames.length === 0) {
+
+                // Never got a preview frame - reject so the await
+                // below throws and this falls back to the static
+                // image, matching the original behavior.
+                rejectFirstFrame(error);
+
+            } else {
+
+                console.error(
+                    "Failed decoding/baking remaining Laughing Man frames:",
+                    error
+                );
+            }
+        });
+
+        await firstFrameReady;
+
+        if (bakedFrames.length === 0) {
+            throw new Error(
+                "Laughing Man GIF has no frames"
+            );
         }
-
-        console.log(
-            `Laughing Man loaded: ${laughingManFrames.length} frame(s)`
-        );
 
     } catch (error) {
 
@@ -1258,7 +1532,8 @@ async function loadLaughingManStaticFallback() {
 }
 
 // ============================================================
-// Decode a GIF ArrayBuffer into full-canvas RGBA frames
+// Decode a GIF ArrayBuffer into full-canvas RGBA frames, IN BATCHES,
+// yielding to the browser between batches.
 //
 // GIF frames are often just the CHANGED region of the canvas, not the
 // whole image, so each one gets composited onto a persistent canvas
@@ -1269,15 +1544,30 @@ async function loadLaughingManStaticFallback() {
 // than being pixel-perfect, which is a reasonable tradeoff for how
 // this is actually going to be used (a short, clean, purpose-made
 // loop rather than an arbitrary found GIF).
+//
+// decompressFrames() (the vendored decoder) decompresses every
+// frame's full RGBA patch in one synchronous call - for a large,
+// many-frame GIF that's several seconds of solid main-thread work
+// (measured ~12s for the 240-frame/8.5MB Laughing Man source), during
+// which nothing can render or respond to input at all. Calling it
+// repeatedly on small SLICES of parsed.frames instead (it only reads
+// frames/gct off whatever object it's given, so a shallow copy with a
+// sliced frames array decodes just that slice) gets the same result
+// broken into small enough pieces to yield between, without changing
+// what gets decoded or how compositing/disposal works - every frame
+// is still processed in order exactly as before, onFrame is just
+// called as each one becomes ready instead of after all of them are.
 // ============================================================
 
-function decodeGifFrames(arrayBuffer) {
+const GIF_DECODE_BATCH_SIZE = 4;
+
+async function decodeGifFramesProgressive(arrayBuffer, onFrame) {
 
     const parsed =
         parseGIF(arrayBuffer);
 
-    const frames =
-        decompressFrames(parsed, true);
+    const totalFrames =
+        parsed.frames.filter(f => f.image).length;
 
     const width = parsed.lsd.width;
     const height = parsed.lsd.height;
@@ -1297,65 +1587,93 @@ function decodeGifFrames(arrayBuffer) {
     const patchCtx =
         patchCanvas.getContext('2d');
 
-    const results = [];
+    let producedIndex = 0;
 
-    for (const frame of frames) {
+    for (
+        let start = 0;
+        start < parsed.frames.length;
+        start += GIF_DECODE_BATCH_SIZE
+    ) {
 
-        const { dims } = frame;
-
-        patchCanvas.width = dims.width;
-        patchCanvas.height = dims.height;
-
-        const patchImageData =
-            patchCtx.createImageData(
-                dims.width,
-                dims.height
+        const batchFrames =
+            decompressFrames(
+                {
+                    ...parsed,
+                    frames: parsed.frames.slice(
+                        start,
+                        start + GIF_DECODE_BATCH_SIZE
+                    )
+                },
+                true
             );
 
-        patchImageData.data.set(frame.patch);
+        for (const frame of batchFrames) {
 
-        patchCtx.putImageData(
-            patchImageData,
-            0,
-            0
-        );
+            const { dims } = frame;
 
-        persistentCtx.drawImage(
-            patchCanvas,
-            dims.left,
-            dims.top
-        );
+            patchCanvas.width = dims.width;
+            patchCanvas.height = dims.height;
 
-        // Snapshot the full canvas as this frame's result - has to be
-        // a fresh canvas per frame since persistentCanvas keeps
-        // getting drawn on for subsequent frames.
-        const frameCanvas =
-            document.createElement('canvas');
+            const patchImageData =
+                patchCtx.createImageData(
+                    dims.width,
+                    dims.height
+                );
 
-        frameCanvas.width = width;
-        frameCanvas.height = height;
+            patchImageData.data.set(frame.patch);
 
-        frameCanvas
-            .getContext('2d')
-            .drawImage(persistentCanvas, 0, 0);
+            patchCtx.putImageData(
+                patchImageData,
+                0,
+                0
+            );
 
-        results.push({
-            canvas: frameCanvas,
-            delay: Math.max(20, frame.delay || 100)
-        });
-
-        if (frame.disposalType === 2) {
-
-            persistentCtx.clearRect(
+            persistentCtx.drawImage(
+                patchCanvas,
                 dims.left,
-                dims.top,
-                dims.width,
-                dims.height
+                dims.top
             );
-        }
-    }
 
-    return results;
+            // Snapshot the full canvas as this frame's result - has to
+            // be a fresh canvas per frame since persistentCanvas keeps
+            // getting drawn on for subsequent frames.
+            const frameCanvas =
+                document.createElement('canvas');
+
+            frameCanvas.width = width;
+            frameCanvas.height = height;
+
+            frameCanvas
+                .getContext('2d')
+                .drawImage(persistentCanvas, 0, 0);
+
+            if (frame.disposalType === 2) {
+
+                persistentCtx.clearRect(
+                    dims.left,
+                    dims.top,
+                    dims.width,
+                    dims.height
+                );
+            }
+
+            onFrame(
+                {
+                    canvas: frameCanvas,
+                    delay: Math.max(20, frame.delay || 100)
+                },
+                producedIndex,
+                totalFrames
+            );
+
+            producedIndex++;
+        }
+
+        // Yield so the tab stays responsive between batches.
+        await new Promise(
+            (resolve) => requestAnimationFrame(resolve)
+        );
+    }
 }
 
 // ============================================================
@@ -1368,6 +1686,16 @@ function decodeGifFrames(arrayBuffer) {
 // ============================================================
 
 function uploadCanvasAsTexture(gl, canvas) {
+
+    // Uploading a new texture shouldn't disturb whatever texture is
+    // currently bound and actively being displayed (e.g. while this
+    // runs as part of baking further GIF frames in the background -
+    // see loadLaughingMan and rebakeAnimatedGifFrames). Restoring the
+    // prior binding instead of unconditionally clearing it to null
+    // keeps this function safe to call at any time, not just before
+    // anything else is on screen.
+    const previousBinding =
+        gl.getParameter(gl.TEXTURE_BINDING_2D);
 
     const texture =
         gl.createTexture();
@@ -1391,7 +1719,7 @@ function uploadCanvasAsTexture(gl, canvas) {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
 
-    gl.bindTexture(gl.TEXTURE_2D, null);
+    gl.bindTexture(gl.TEXTURE_2D, previousBinding);
 
     return texture;
 }
@@ -1461,6 +1789,11 @@ async function rebakeAnimatedGifFrames() {
 
     isProcessingGif = true;
 
+    loadGeneration++;
+
+    const myGeneration =
+        loadGeneration;
+
     const oldFrames = animatedGifFrames;
 
     const freshFrames =
@@ -1476,12 +1809,26 @@ async function rebakeAnimatedGifFrames() {
             }
         );
 
+    // Always kept up to date, regardless of whether this is still the
+    // active selection - if the person switches back to this gif (or
+    // changes face count again), it should reflect this bake, not a
+    // stale one.
     animatedGifFrames = freshFrames;
-    activeAnimatedFrames = animatedGifFrames;
-    animatedGifFrameIndex = 0;
-    animatedGifElapsedMs = 0;
 
-    bindActiveAnimatedFrame();
+    if (myGeneration === loadGeneration) {
+
+        activeAnimatedFrames = animatedGifFrames;
+        animatedGifFrameIndex = 0;
+        animatedGifElapsedMs = 0;
+
+        bindActiveAnimatedFrame();
+
+    } else {
+
+        console.log(
+            "GIF rebake finished but a different texture is now selected - caching without changing the display"
+        );
+    }
 
     // Free the previous batch of textures now that they're no longer
     // referenced - GIFs can mean dozens of these.
@@ -1491,9 +1838,7 @@ async function rebakeAnimatedGifFrames() {
         }
     }
 
-    if (uploadStatus) {
-        uploadStatus.textContent = '';
-    }
+    showUploadStatusIdle();
 
     isProcessingGif = false;
 }
@@ -1503,6 +1848,11 @@ async function rebakeAnimatedGifFrames() {
 // ============================================================
 
 async function applyAnimatedGif(arrayBuffer) {
+
+    // A whole-globe animated GIF replaces any shader-composited
+    // per-face content wholesale (same rule as every other preset
+    // switch below).
+    clearAllFaceSlots();
 
     activeCustomKind = 'image';
 
@@ -1514,8 +1864,23 @@ async function applyAnimatedGif(arrayBuffer) {
 
     try {
 
-        let frames =
-            decodeGifFrames(arrayBuffer);
+        const decodedFrames = [];
+
+        await decodeGifFramesProgressive(
+            arrayBuffer,
+            (frame, index, total) => {
+
+                decodedFrames.push(frame);
+
+                if (uploadStatus) {
+
+                    uploadStatus.textContent =
+                        `Decoding GIF (${index + 1}/${total})...`;
+                }
+            }
+        );
+
+        let frames = decodedFrames;
 
         if (frames.length === 0) {
             throw new Error("GIF has no frames");
@@ -1573,13 +1938,40 @@ async function applyAnimatedGif(arrayBuffer) {
 }
 
 // ============================================================
+// Shows the last-chosen upload filename in the status line, or clears
+// it if nothing's been chosen. Used once processing finishes (instead
+// of clearing straight to '') so the person can still see which file
+// is actually loaded even though the <input> itself has been reset
+// back to its native "No file chosen" state (see lastUploadedFileName
+// above).
+// ============================================================
+
+function showUploadStatusIdle() {
+
+    if (uploadStatus) {
+
+        uploadStatus.textContent =
+            lastUploadedFileName ?
+                `Loaded: ${lastUploadedFileName}` :
+                '';
+    }
+}
+
+// ============================================================
 // Tears down any active USER-UPLOADED GIF state (frees its textures)
-// - called whenever a different texture/mode becomes active. Never
-// touches laughingManFrames, which is cached independently and only
-// ever freed if it needs re-fetching (it doesn't, once loaded).
+// and stops WHATEVER is currently animating (regardless of whether it
+// came from a user-uploaded GIF or the cached Laughing Man frames) -
+// called whenever a different texture/mode becomes active. Never
+// deletes laughingManFrames' own textures, which stay cached
+// independently and only ever get re-fetched if needed (they don't,
+// once loaded).
 // ============================================================
 
 function clearAnimatedGif() {
+
+    // Signals "something newer than any in-flight async texture load
+    // has now been requested" - see loadGeneration's own comment.
+    loadGeneration++;
 
     if (animatedGifFrames && p && p.gl) {
 
@@ -1588,9 +1980,16 @@ function clearAnimatedGif() {
         }
     }
 
-    if (activeAnimatedFrames === animatedGifFrames) {
-        activeAnimatedFrames = null;
-    }
+    // Unconditional: activeAnimatedFrames may currently point at
+    // animatedGifFrames (a user-uploaded GIF) OR at laughingManFrames
+    // (the cached Laughing Man bake) - either way, we're switching
+    // away from it, so animate()'s own cycling logic must stop
+    // re-binding frames from it. Previously this only checked the
+    // animatedGifFrames case, so switching away from an active
+    // Laughing Man animation left it pointed at laughingManFrames,
+    // which animate() would then keep re-binding every ~200ms forever,
+    // clobbering whatever texture was supposed to replace it.
+    activeAnimatedFrames = null;
 
     rawGifFrames = null;
     animatedGifFrames = null;
@@ -1604,30 +2003,548 @@ function clearAnimatedGif() {
 
 
 // ============================================================
-// Set the image for one face slot (0 = primary/fallback, 1-5 = an
-// override for that specific face) and regenerate.
+// Independent per-face animation (shader-composited mode)
 //
-// Setting the primary (slot 0) starts fresh and clears any existing
-// per-face overrides, since a whole new primary image usually means
-// "start over" rather than "keep my old overrides on a new base".
+// Each per-face slot can hold its OWN animated GIF - decoded once,
+// uploaded as one WebGL texture per frame, and advanced on its own
+// timer inside animate(). The fragment shader composites all six
+// face textures live (sampleFaceComposite), so no per-frame CPU
+// rebake is needed and every face animates independently.
+//
+// faceSlotContent[i] = {
+//   kind: 'gif' | 'image',
+//   frames: [{texture, delay}]   - gif: baked frame textures
+//   image: <img>                 - image: static source
+//   texture: <WebGLTexture>      - image: uploaded texture
+//   width, height,               - source dimensions (for logoScale)
+//   frameIndex, elapsedMs        - gif playback state
+// }
+//
+// While this mode is active, uUseFaces=1 and the shader does the
+// compositing; the CPU-baked uTexture path is untouched for every
+// other texture source.
+// ============================================================
+
+// Frees one slot's GPU resources and removes it. Does not refresh
+// the display on its own - callers follow with a composite update.
+function disposeFaceSlot(index) {
+
+    const content =
+        faceSlotContent[index];
+
+    if (
+        !content ||
+        !p ||
+        !p.gl
+    ) {
+
+        delete faceSlotContent[index];
+
+        return;
+    }
+
+    if (content.kind === 'gif') {
+
+        for (const frame of content.frames) {
+            p.gl.deleteTexture(frame.texture);
+        }
+
+    } else if (content.texture) {
+
+        p.gl.deleteTexture(content.texture);
+    }
+
+    delete faceSlotContent[index];
+}
+
+// Frees EVERY slot's GPU resources and deactivates the mode. Called
+// whenever the globe switches to any non-per-face texture source.
+function clearAllFaceSlots() {
+
+    for (let i = 0; i < MAX_FACE_SLOTS; i++) {
+        disposeFaceSlot(i);
+    }
+
+    deactivateFaceComposite();
+}
+
+// Pushes the current per-face state into the shader uniforms and
+// switches the globe into or out of shader-composite mode. Safe to
+// call any time after createGlobe() has run; no-ops before that.
+function updateFaceComposite() {
+
+    if (!p || !p.gl || !instance) {
+        return;
+    }
+
+    // Nothing left in any slot -> leave composite mode entirely. The
+    // CPU-baked texture that was showing before this mode began is
+    // still bound, so the globe just falls back to it seamlessly.
+    let used = 0;
+
+    for (let i = 0; i < MAX_FACE_SLOTS; i++) {
+        if (faceSlotContent[i]) used++;
+    }
+
+    if (
+        used === 0 ||
+        activeCustomKind !== 'image' ||
+        faceCount === 1
+    ) {
+
+        deactivateFaceComposite();
+
+        return;
+    }
+
+    const angularRadiusDeg =
+        getAngularRadiusForFaceCount(faceCount);
+
+    const radiusRad =
+        angularRadiusDeg * Math.PI / 180;
+
+    const cosRadius =
+        Math.cos(radiusRad);
+
+    const halfSize =
+        Math.tan(radiusRad);
+
+    const centers =
+        getFaceCenters(faceCount);
+
+    // Faces with no content of their own fall back to the first slot
+    // that HAS content - the composite-mode equivalent of
+    // rawCustomImages[i] || rawCustomImages[0] (which only ever
+    // fell back to slot 0 because slot 0 was the only way in).
+    let fallbackSlot = -1;
+
+    for (let i = 0; i < faceCount; i++) {
+
+        if (faceSlotContent[i]) {
+
+            fallbackSlot = i;
+
+            break;
+        }
+    }
+
+    if (fallbackSlot === -1) {
+
+        deactivateFaceComposite();
+
+        return;
+    }
+
+    const centerArr = [];
+    const eastArr = [];
+    const northArr = [];
+    const paramArr = [];
+
+    for (let i = 0; i < 6; i++) {
+
+        // Slots beyond the active face count get zeroed centers so
+        // the shader's dot() check never selects them.
+        if (i >= faceCount) {
+
+            centerArr.push(0, 0, 0);
+            eastArr.push(0, 0, 0);
+            northArr.push(0, 0, 0);
+            paramArr.push(0, 0, 0, 0);
+
+            continue;
+        }
+
+        const content =
+            faceSlotContent[i] ||
+            faceSlotContent[fallbackSlot];
+
+        // Which texture unit this face samples: its own slot when it
+        // has an override, otherwise the fallback slot.
+        const texSlot =
+            faceSlotContent[i] ?
+                i :
+                fallbackSlot;
+
+        const center =
+            centers[i];
+
+        const basis =
+            createTangentBasis(center);
+
+        centerArr.push(
+            center.x,
+            center.y,
+            center.z
+        );
+
+        eastArr.push(
+            basis.east.x,
+            basis.east.y,
+            basis.east.z
+        );
+
+        northArr.push(
+            basis.north.x,
+            basis.north.y,
+            basis.north.z
+        );
+
+        // Same logoScale math as generateGlobeTexture(): the image is
+        // scaled so its larger dimension spans the full tangent patch.
+        const logoRadius =
+            Math.max(
+                content.width,
+                content.height
+            ) / 2;
+
+        const logoScale =
+            halfSize / logoRadius;
+
+        // x: cosine test for patch membership (same for every face);
+        // y/z: tangent -> normalized-image-coord scale factors;
+        // w: which slot's texture this face samples.
+        paramArr.push(
+            cosRadius,
+            1 / (logoScale * content.width),
+            1 / (logoScale * content.height),
+            texSlot
+        );
+    }
+
+    instance.uniforms.uFaceCenter.value =
+        centerArr;
+
+    instance.uniforms.uFaceEast.value =
+        eastArr;
+
+    instance.uniforms.uFaceNorth.value =
+        northArr;
+
+    instance.uniforms.uFaceParams.value =
+        paramArr;
+
+    instance.uniforms.uFaceCountF.value =
+        faceCount;
+
+    faceCompositeActive = true;
+
+    instance.uniforms.uUseFaces.value = 1;
+
+    // Taking over the sphere means the classic animation stream must
+    // stand down - it keeps binding to TEXTURE0 (which is now
+    // uFaceTex0) and would clobber face 1's frames every tick.
+    clearAnimatedGif();
+
+    renderFaceSlotThumbnails();
+}
+
+function deactivateFaceComposite() {
+
+    faceCompositeActive = false;
+
+    if (instance && instance.uniforms.uUseFaces) {
+        instance.uniforms.uUseFaces.value = 0;
+    }
+}
+
+// Binds each slot's CURRENT frame to its own texture unit. Called
+// right after the mode activates and whenever any slot crosses a
+// frame boundary during playback. The fallback slot must match what
+// updateFaceComposite wrote into uFaceParams[].w.
+function getFallbackFaceSlot() {
+
+    for (let i = 0; i < faceCount; i++) {
+
+        if (faceSlotContent[i]) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+function bindFaceCompositeFrames() {
+
+    if (
+        !p ||
+        !p.gl ||
+        !faceCompositeActive
+    ) {
+        return;
+    }
+
+    const fallbackSlot =
+        getFallbackFaceSlot();
+
+    if (fallbackSlot === -1) {
+        return;
+    }
+
+    for (let i = 0; i < MAX_FACE_SLOTS; i++) {
+
+        p.gl.activeTexture(
+            p.gl.TEXTURE0 + i
+        );
+
+        // Slot with no content of its own shows the fallback slot's
+        // current frame - matching the .w index the shader reads.
+        const texture =
+            getFaceSlotCurrentTexture(
+                faceSlotContent[i] ? i : fallbackSlot
+            );
+
+        p.gl.bindTexture(
+            p.gl.TEXTURE_2D,
+            texture || null
+        );
+    }
+
+    // The rest of the pipeline (createTexture, uploadCanvasAsTexture,
+    // loadTexture...) assumes it runs on texture unit 0 - leaving the
+    // active unit on TEXTURE5 here would silently corrupt every later
+    // upload/bind.
+    p.gl.activeTexture(p.gl.TEXTURE0);
+}
+
+function getFaceSlotCurrentTexture(index) {
+
+    const content =
+        faceSlotContent[index];
+
+    if (!content) {
+        return null;
+    }
+
+    if (content.kind === 'gif') {
+
+        return content.frames[
+            content.frameIndex
+        ].texture;
+    }
+
+    return content.texture;
+}
+
+// Decodes + bakes an uploaded GIF into one slot of the independent
+// per-face animation system. Entry point for GIF files chosen through
+// the per-face buttons AND for GIFs chosen via the main choose-file
+// picker while the per-face UI is visible (so both paths animate).
+async function applyFaceSlotGif(arrayBuffer, index) {
+
+    if (!p || !p.gl) {
+        return;
+    }
+
+    loadGeneration++;
+
+    const myGeneration =
+        loadGeneration;
+
+    if (uploadStatus) {
+        uploadStatus.textContent = 'Decoding GIF...';
+    }
+
+    try {
+
+        const decodedFrames = [];
+
+        await decodeGifFramesProgressive(
+            arrayBuffer,
+            (frame, frameIndex, total) => {
+
+                decodedFrames.push(frame);
+
+                if (uploadStatus) {
+
+                    uploadStatus.textContent =
+                        `Decoding GIF (${frameIndex + 1}/${total})...`;
+                }
+            }
+        );
+
+        if (myGeneration !== loadGeneration) {
+
+            console.log(
+                "Per-face GIF decode finished but a newer texture was requested in the meantime - discarding"
+            );
+
+            return;
+        }
+
+        let frames = decodedFrames;
+
+        if (frames.length === 0) {
+            throw new Error("GIF has no frames");
+        }
+
+        if (frames.length > MAX_GIF_FRAMES) {
+
+            const step =
+                frames.length / MAX_GIF_FRAMES;
+
+            const sampled = [];
+
+            for (let i = 0; i < MAX_GIF_FRAMES; i++) {
+                sampled.push(frames[Math.floor(i * step)]);
+            }
+
+            frames = sampled;
+        }
+
+        // Free this slot's previous content BEFORE baking the new
+        // frames so two generations don't coexist in GPU memory.
+        disposeFaceSlot(index);
+
+        const bakedFrames = [];
+
+        for (let i = 0; i < frames.length; i++) {
+
+            if (
+                uploadStatus &&
+                i % 8 === 0
+            ) {
+                uploadStatus.textContent =
+                    `Preparing frame ${i + 1}/${frames.length}...`;
+            }
+
+            bakedFrames.push({
+                texture: uploadCanvasAsTexture(
+                    p.gl,
+                    frames[i].canvas
+                ),
+                delay: frames[i].delay
+            });
+
+            if (i % 4 === 0) {
+
+                await new Promise(
+                    (resolve) =>
+                        requestAnimationFrame(resolve)
+                );
+            }
+        }
+
+        if (myGeneration !== loadGeneration) {
+
+            for (const frame of bakedFrames) {
+                p.gl.deleteTexture(frame.texture);
+            }
+
+            console.log(
+                "Per-face GIF bake finished but a newer texture was requested in the meantime - discarding"
+            );
+
+            return;
+        }
+
+        faceSlotContent[index] = {
+            kind: 'gif',
+            frames: bakedFrames,
+            width: frames[0].canvas.width,
+            height: frames[0].canvas.height,
+            // Captured once - baked frames keep only their GPU texture,
+            // so the thumbnail can't read a canvas later.
+            thumbUrl: frames[0].canvas.toDataURL(),
+            frameIndex: 0,
+            elapsedMs: 0
+        };
+
+        updateFaceComposite();
+
+        bindFaceCompositeFrames();
+
+        showUploadStatusIdle();
+
+        renderFaceSlotThumbnails();
+
+        console.log(
+            `Per-face GIF loaded on face ${index}: ${bakedFrames.length} frame(s)`
+        );
+
+    } catch (error) {
+
+        console.error(
+            "Failed to load per-face GIF:",
+            error
+        );
+
+        if (uploadStatus) {
+
+            uploadStatus.textContent =
+                'Could not read that GIF - see console.';
+
+            setTimeout(
+                () => {
+                    if (uploadStatus) uploadStatus.textContent = '';
+                },
+                4000
+            );
+        }
+    }
+}
+
+// Loads a STATIC image into one slot of the per-face system. Statics
+// live here too (rather than in rawCustomImages) so mixing a static
+// image on one face with an animated GIF on another works naturally -
+// the shader doesn't care which slots move.
+async function applyFaceSlotImage(image, index) {
+
+    if (!p || !p.gl) {
+        return;
+    }
+
+    disposeFaceSlot(index);
+
+    const texture =
+        uploadCanvasAsTexture(p.gl, image);
+
+    faceSlotContent[index] = {
+        kind: 'image',
+        image,
+        texture,
+        width: image.width,
+        height: image.height
+    };
+
+    // A NEW primary (slot 0) means "start over" - drop any stale
+    // overrides, same rule applyCustomImage applies to
+    // rawCustomImages.
+    if (index === 0) {
+
+        for (let i = 1; i < MAX_FACE_SLOTS; i++) {
+            disposeFaceSlot(i);
+        }
+    }
+
+    updateFaceComposite();
+
+    bindFaceCompositeFrames();
+
+    renderFaceSlotThumbnails();
+}
+
+// ============================================================
+// Set the globe texture from a STATIC image chosen through the main
+// Upload picker (single-face / whole-globe bake path).
+//
+// Per-face overrides no longer route here - they go through
+// applyFaceSlotImage/applyFaceSlotGif above. This function now only
+// serves the classic CPU-baked pipeline, so it also tears down the
+// shader-composite mode (a fresh whole-globe image means the per-face
+// content is being replaced wholesale).
 // ============================================================
 
 async function applyCustomImage(image, faceIndex = 0) {
+
+    clearAllFaceSlots();
 
     clearAnimatedGif();
 
     activeCustomKind = 'image';
 
-    if (faceIndex === 0) {
-
-        rawCustomImages = {
-            0: image
-        };
-
-    } else {
-
-        rawCustomImages[faceIndex] = image;
-    }
+    rawCustomImages = {
+        0: image
+    };
 
     await regenerateCustomImageTexture();
 
@@ -1706,6 +2623,8 @@ async function regenerateCustomImageTexture() {
 // ============================================================
 
 async function applyCustomText(text) {
+
+    clearAllFaceSlots();
 
     activeCustomKind = 'text';
     clearAnimatedGif();
@@ -1799,6 +2718,26 @@ async function createGlobe() {
 
                 devicePixelRatio:
                     window.devicePixelRatio || 1,
+
+                // Phenomenon normally runs its OWN internal
+                // requestAnimationFrame loop (rendering with
+                // whatever's in p.uniforms) in addition to - and
+                // completely uncoordinated with - the animate() loop
+                // below. Both loops draw to the same canvas, and
+                // during any heavy synchronous work (baking GIF
+                // frames, which creates/deletes WebGL textures) they
+                // can interleave badly: one loop redraws mid-update,
+                // producing a visible flash/"restart" that then
+                // settles once the work finishes. animate() already
+                // does everything Phenomenon's own loop would, so
+                // that second loop is disabled here. (It still runs
+                // ONCE, synchronously, at the end of the constructor
+                // below - harmless, since no instance exists yet.)
+                // See animate() for how uProjectionMatrix/uViewMatrix/
+                // uModelMatrix/uResolution - previously kept fresh
+                // only via that internal loop picking up window-resize
+                // updates - still get propagated without it.
+                shouldRender: false,
             }
         });
 
@@ -1840,6 +2779,75 @@ async function createGlobe() {
                     uTexture: {
                         type: "sampler2D",
                         value: 0
+                    },
+
+                    /*
+                     * Per-face shader-composited mode (see
+                     * applyFaceSlotFile / updateFaceComposite). Inactive
+                     * (0) for every CPU-baked texture path; the face
+                     * arrays stay zeroed until a per-face upload
+                     * activates the mode. Plain arrays (not typed
+                     * arrays) here because Phenomenon's add() JSON
+                     * round-trips the uniforms object.
+                     */
+                    uUseFaces: {
+                        type: "float",
+                        value: 0
+                    },
+
+                    uFaceCountF: {
+                        type: "float",
+                        value: 6
+                    },
+
+                    uFaceCenter: {
+                        type: "vec3",
+                        value: new Array(18).fill(0)
+                    },
+
+                    uFaceEast: {
+                        type: "vec3",
+                        value: new Array(18).fill(0)
+                    },
+
+                    uFaceNorth: {
+                        type: "vec3",
+                        value: new Array(18).fill(0)
+                    },
+
+                    uFaceParams: {
+                        type: "vec4",
+                        value: new Array(24).fill(0)
+                    },
+
+                    uFaceTex0: {
+                        type: "sampler2D",
+                        value: 0
+                    },
+
+                    uFaceTex1: {
+                        type: "sampler2D",
+                        value: 1
+                    },
+
+                    uFaceTex2: {
+                        type: "sampler2D",
+                        value: 2
+                    },
+
+                    uFaceTex3: {
+                        type: "sampler2D",
+                        value: 3
+                    },
+
+                    uFaceTex4: {
+                        type: "sampler2D",
+                        value: 4
+                    },
+
+                    uFaceTex5: {
+                        type: "sampler2D",
+                        value: 5
                     },
 
                     /*
@@ -2088,6 +3096,67 @@ function animate(timestamp) {
         }
     }
 
+    // Independent per-face animation streams (shader-composited mode).
+    // Every slot advances on its own timer against its own frames'
+    // delays, and only slots that actually crossed a boundary trigger a
+    // rebind - so a 50ms GIF next to a 500ms GIF each play at their own
+    // rate, and static-only setups cost nothing at all.
+    if (
+        faceCompositeActive &&
+        p &&
+        p.gl
+    ) {
+
+        let anyCrossed = false;
+
+        for (let i = 0; i < MAX_FACE_SLOTS; i++) {
+
+            const content =
+                faceSlotContent[i];
+
+            if (
+                !content ||
+                content.kind !== 'gif' ||
+                i >= faceCount
+            ) {
+                continue;
+            }
+
+            content.elapsedMs += deltaMs;
+
+            let guard = 0;
+
+            while (
+                content.elapsedMs >=
+                content.frames[content.frameIndex].delay &&
+                guard < content.frames.length
+            ) {
+
+                content.elapsedMs -=
+                    content.frames[content.frameIndex].delay;
+
+                content.frameIndex =
+                    (content.frameIndex + 1) %
+                    content.frames.length;
+
+                anyCrossed = true;
+
+                guard++;
+            }
+        }
+
+        // Only rebind when at least one stream moved - and always
+        // restore the active texture unit to 0 afterwards (see
+        // bindFaceCompositeFrames) so the rest of the pipeline is
+        // unaffected.
+        if (anyCrossed) {
+
+            bindFaceCompositeFrames();
+
+            p.gl.activeTexture(p.gl.TEXTURE0);
+        }
+    }
+
     // Paused: keep rendering every frame (so the Phi/Theta sliders
     // stay live and responsive), just stop auto-incrementing them.
     if (!isPaused) {
@@ -2109,6 +3178,16 @@ function animate(timestamp) {
     }
 
     const uniforms = {
+
+        // p.uniforms carries uProjectionMatrix/uViewMatrix/
+        // uModelMatrix (recomputed on window resize by Phenomenon's
+        // own, still-active resize listener) and uResolution (kept
+        // current by main.js's own resize handler below). Spreading
+        // it first, every frame, is what keeps those in sync now that
+        // Phenomenon's internal render loop - which used to carry
+        // them over on its own - is disabled; the explicit keys below
+        // then apply this frame's actual live values on top.
+        ...p.uniforms,
 
         phi: {
             type: "float",
@@ -2344,6 +3423,18 @@ faceCountInputs.forEach(
 
                 renderFaceSlotThumbnails();
 
+                // Per-face shader-composited content: just recompute
+                // the face geometry uniforms - no rebake needed, that's
+                // the whole point of compositing in the shader.
+                if (faceCompositeActive) {
+
+                    updateFaceComposite();
+
+                    bindFaceCompositeFrames();
+
+                    return;
+                }
+
                 if (rawGifFrames) {
 
                     await rebakeAnimatedGifFrames();
@@ -2471,7 +3562,18 @@ if (faceSlotsContainer) {
         thumb.type = 'button';
         thumb.className = 'face-slot-thumb';
         thumb.title = `Face ${i + 1}`;
-        thumb.textContent = String(i + 1);
+
+        // A dedicated badge for the face number, kept separate from
+        // any thumbnail preview image (see renderFaceSlotThumbnails)
+        // so the number stays visible once a face has an image
+        // instead of being overwritten by it.
+        const numberBadge =
+            document.createElement('span');
+
+        numberBadge.className = 'face-slot-number';
+        numberBadge.textContent = String(i + 1);
+
+        thumb.appendChild(numberBadge);
 
         const slotFileInput =
             document.createElement('input');
@@ -2509,6 +3611,49 @@ if (faceSlotsContainer) {
                     return;
                 }
 
+                lastUploadedFileName = file.name;
+
+                // ------------------------------------------------
+                // Animated GIF -> this face's own independent
+                // animation stream (shader-composited, see
+                // faceSlotContent). Everything else -> a static
+                // texture on just this face. Both live in the
+                // per-face system, so a static on one face and a
+                // GIF on another mix freely.
+                // ------------------------------------------------
+
+                if (file.type === 'image/gif') {
+
+                    const gifReader =
+                        new FileReader();
+
+                    gifReader.onload =
+                        function(event) {
+
+                            applyFaceSlotGif(
+                                event.target.result,
+                                i
+                            );
+                        };
+
+                    gifReader.onerror =
+                        function() {
+
+                            console.error(
+                                "FileReader failed:",
+                                gifReader.error
+                            );
+                        };
+
+                    gifReader.readAsArrayBuffer(
+                        file
+                    );
+
+                    e.target.value = '';
+
+                    return;
+                }
+
                 const reader =
                     new FileReader();
 
@@ -2521,10 +3666,12 @@ if (faceSlotsContainer) {
                         img.onload =
                             async () => {
 
-                                await applyCustomImage(
+                                await applyFaceSlotImage(
                                     img,
                                     i
                                 );
+
+                                showUploadStatusIdle();
                             };
 
                         img.src =
@@ -2579,26 +3726,53 @@ function renderFaceSlotThumbnails() {
 
             slot.thumb.style.display = 'flex';
 
-            const img =
+            // Prefer per-face system content (the only place per-face
+            // uploads land now), falling back to the legacy
+            // rawCustomImages bake for anything still in it.
+            const faceContent =
+                faceSlotContent[i] ||
+                faceSlotContent[0];
+
+            const legacyImg =
                 rawCustomImages[i] ||
                 rawCustomImages[0];
 
-            if (img && img.src) {
+            let previewSrc = null;
+
+            if (faceContent) {
+
+                // GIFs keep a pre-captured thumbnail URL (their baked
+                // frames hold only GPU textures); statics keep the
+                // original <img>, which has .src.
+                previewSrc =
+                    faceContent.thumbUrl ||
+                    (faceContent.image && faceContent.image.src) ||
+                    null;
+
+            } else if (legacyImg) {
+
+                // Normally an <img> (has .src); a frozen GIF frame is
+                // a plain <canvas>, which has no .src.
+                previewSrc =
+                    legacyImg.src ||
+                    (legacyImg.toDataURL &&
+                        legacyImg.toDataURL());
+            }
+
+            if (previewSrc) {
 
                 slot.thumb.style.backgroundImage =
-                    `url(${img.src})`;
-
-                slot.thumb.textContent = '';
+                    `url(${previewSrc})`;
 
                 slot.thumb.classList.toggle(
                     'is-override',
-                    Boolean(rawCustomImages[i])
+                    Boolean(faceSlotContent[i]) ||
+                        Boolean(rawCustomImages[i])
                 );
 
             } else {
 
                 slot.thumb.style.backgroundImage = '';
-                slot.thumb.textContent = String(i + 1);
                 slot.thumb.classList.remove('is-override');
             }
         }
@@ -2687,6 +3861,8 @@ if (
             // ------------------------------------------------
 
             activeCustomKind = null;
+
+            clearAllFaceSlots();
 
             clearAnimatedGif();
 
@@ -2786,6 +3962,11 @@ if (fileUpload) {
                 return;
             }
 
+            // Remembered for display in uploadStatus once loading
+            // finishes (see showUploadStatusIdle) - the <input>'s own
+            // "chosen file" text gets reset below, in both branches.
+            lastUploadedFileName = file.name;
+
             // ------------------------------------------------
             // Animated GIF - separate pipeline (see
             // applyAnimatedGif). Everything else below this
@@ -2794,6 +3975,50 @@ if (fileUpload) {
             // ------------------------------------------------
 
             if (file.type === 'image/gif') {
+
+                // ------------------------------------------------
+                // With multiple faces selected, the globe is being
+                // driven by the per-face (shader-composited) system,
+                // so the GIF becomes face 1's own independent
+                // animation - identical to picking it through a
+                // per-face button. Single-face mode keeps using the
+                // classic whole-globe bake pipeline below.
+                // ------------------------------------------------
+
+                if (
+                    activeCustomKind === 'image' &&
+                    faceCount > 1
+                ) {
+
+                    const gifReader =
+                        new FileReader();
+
+                    gifReader.onload =
+                        function(event) {
+
+                            applyFaceSlotGif(
+                                event.target.result,
+                                0
+                            );
+                        };
+
+                    gifReader.onerror =
+                        function() {
+
+                            console.error(
+                                "FileReader failed:",
+                                gifReader.error
+                            );
+                        };
+
+                    gifReader.readAsArrayBuffer(
+                        file
+                    );
+
+                    e.target.value = '';
+
+                    return;
+                }
 
                 const gifReader =
                     new FileReader();
@@ -2842,6 +4067,8 @@ if (fileUpload) {
 
                             await applyCustomImage(img);
 
+                            showUploadStatusIdle();
+
                         };
 
                     img.onerror =
@@ -2884,17 +4111,35 @@ if (fileUpload) {
 // ============================================================
 // Export as loopable GIF
 //
-// Renders a fixed number of frames sampled evenly across exactly one
-// full rotation loop (so frame N wraps seamlessly back to frame 0),
-// independent of the live animation's frame rate. Axis spin loops
-// phi through a full turn; randomized spin loops theta through one
-// turn while phi does two (matching the live 2:1 PHI_RATE:THETA_RATE
-// ratio), since that's the point where both angles simultaneously
-// return to their starting values.
+// Renders frames sampled evenly across exactly one full rotation loop
+// (so frame N wraps seamlessly back to frame 0), independent of the
+// live animation's frame rate. Axis spin loops phi through a full
+// turn; randomized spin loops theta through one turn while phi does
+// two (matching the live 2:1 PHI_RATE:THETA_RATE ratio), since that's
+// the point where both angles simultaneously return to their starting
+// values.
+//
+// How many frames that takes, and how long each is shown for, is
+// derived at export time (see exportLoopableGif) from PHI_RATE/
+// THETA_RATE themselves, so the export rotates at roughly the same
+// speed the globe actually spins at live rather than a fixed
+// duration.
 // ============================================================
 
-const EXPORT_FRAME_COUNT = 72;
-const EXPORT_FRAME_DELAY_MS = 45;
+// Assumed live playback rate, used ONLY to translate PHI_RATE/
+// THETA_RATE (radians per rendered frame) into a real-world duration.
+// The live animate() loop is itself uncapped/display-rate-driven, but
+// 60fps is a reasonable typical baseline for "how fast this looks".
+const ASSUMED_LIVE_FPS = 60;
+
+// Target spacing between exported frames - a middle ground between
+// smoothness and export time/file size. Actual frame count/delay are
+// derived from this and the loop duration above (see
+// exportLoopableGif), then clamped to the bounds below.
+const EXPORT_TARGET_FRAME_DELAY_MS = 90;
+const EXPORT_MIN_FRAMES = 40;
+const EXPORT_MAX_FRAMES = 200;
+
 const EXPORT_SIZE = 480;
 
 const exportGifBtn =
@@ -2976,6 +4221,53 @@ function readGlobeCropAsImageData(gl, canvasWidth, canvasHeight) {
     return new ImageData(flipped, cropW, cropH);
 }
 
+// ============================================================
+// GIF transparency is strictly 1-bit (a pixel is either fully opaque
+// or fully transparent - no in-between), but the shader's atmospheric
+// glow and antialiased edges are smooth alpha gradients. Quantizing
+// straight to 1-bit alpha (see exportLoopableGif's oneBitAlpha
+// option) snaps that whole gradient to one hard, blocky cutoff line -
+// a jagged halo around the globe that isn't there in the live WebGL
+// rendering, and stands out most against detailed textures (e.g. the
+// Earth map). Applying a small ordered (Bayer 4x4) dither to the
+// alpha channel BEFORE quantizing spreads that cutoff into a soft
+// stipple instead, which reads as a much closer match to the smooth
+// original - the classic way to handle soft edges in a 1-bit-alpha
+// format.
+// ============================================================
+
+const BAYER_4X4 = [
+    [ 0,  8,  2, 10],
+    [12,  4, 14,  6],
+    [ 3, 11,  1,  9],
+    [15,  7, 13,  5]
+];
+
+function ditherAlphaChannel(data, width, height) {
+
+    for (let y = 0; y < height; y++) {
+
+        for (let x = 0; x < width; x++) {
+
+            const i =
+                (y * width + x) * 4 + 3;
+
+            const a = data[i];
+
+            // Already fully transparent/opaque - nothing to dither.
+            if (a === 0 || a === 255) {
+                continue;
+            }
+
+            const threshold =
+                (BAYER_4X4[y % 4][x % 4] + 0.5) / 16 * 255;
+
+            data[i] =
+                a > threshold ? 255 : 0;
+        }
+    }
+}
+
 async function exportLoopableGif() {
 
     if (
@@ -2996,6 +4288,85 @@ async function exportLoopableGif() {
     const startPhi = phi;
     const startTheta = theta;
 
+    // --------------------------------------------------------
+    // How long one full rotation loop actually takes live, from the
+    // SAME PHI_RATE/THETA_RATE the live spin itself uses - this is
+    // what keeps the export's rotation speed matching what's on
+    // screen (previously a fixed 72 frames * 45ms = ~3.2s loop,
+    // several times faster than the live spin actually runs at).
+    // --------------------------------------------------------
+
+    const liveRatePerFrame =
+        spinType === 'axis' ?
+            PHI_RATE :
+            THETA_RATE;
+
+    const loopDurationMs =
+        (2 * Math.PI / liveRatePerFrame / ASSUMED_LIVE_FPS) * 1000;
+
+    const rawFrameCount =
+        Math.round(loopDurationMs / EXPORT_TARGET_FRAME_DELAY_MS);
+
+    const frameCount =
+        Math.min(
+            EXPORT_MAX_FRAMES,
+            Math.max(EXPORT_MIN_FRAMES, rawFrameCount)
+        );
+
+    const frameDelayMs =
+        Math.max(
+            20,
+            Math.round(loopDurationMs / frameCount / 10) * 10
+        );
+
+    // --------------------------------------------------------
+    // If an animated source (an uploaded GIF or Laughing Man) is
+    // active, cycle through ITS frames during export too - on its own
+    // timing, independent of the rotation above - instead of freezing
+    // on whichever single frame happened to be showing when Export
+    // was clicked.
+    // --------------------------------------------------------
+
+    const sourceFrames = activeAnimatedFrames;
+
+    const sourceTotalMs =
+        sourceFrames && sourceFrames.length > 0 ?
+            sourceFrames.reduce((sum, f) => sum + f.delay, 0) :
+            0;
+
+    function bindSourceFrameAtElapsed(elapsedMs) {
+
+        if (
+            !sourceFrames ||
+            sourceFrames.length === 0 ||
+            sourceTotalMs <= 0
+        ) {
+            return;
+        }
+
+        let t = elapsedMs % sourceTotalMs;
+
+        for (const frame of sourceFrames) {
+
+            if (t < frame.delay) {
+
+                p.gl.activeTexture(p.gl.TEXTURE0);
+                p.gl.bindTexture(p.gl.TEXTURE_2D, frame.texture);
+
+                return;
+            }
+
+            t -= frame.delay;
+        }
+
+        // Floating-point edge case (t landed exactly on the total) -
+        // just show the last frame.
+        const last = sourceFrames[sourceFrames.length - 1];
+
+        p.gl.activeTexture(p.gl.TEXTURE0);
+        p.gl.bindTexture(p.gl.TEXTURE_2D, last.texture);
+    }
+
     try {
 
         const gif = GIFEncoder();
@@ -3014,15 +4385,23 @@ async function exportLoopableGif() {
                 willReadFrequently: true
             });
 
-        for (let i = 0; i < EXPORT_FRAME_COUNT; i++) {
+        // Higher-quality downscaling than the 2D canvas default - the
+        // native capture is often several times larger than
+        // EXPORT_SIZE (e.g. on a high-DPI display), and the default
+        // (fast) resampling visibly aliases fine texture detail like
+        // the Earth map's coastlines.
+        exportCtx.imageSmoothingEnabled = true;
+        exportCtx.imageSmoothingQuality = 'high';
+
+        for (let i = 0; i < frameCount; i++) {
 
             if (exportStatus) {
                 exportStatus.textContent =
-                    `Rendering frame ${i + 1}/${EXPORT_FRAME_COUNT}...`;
+                    `Rendering frame ${i + 1}/${frameCount}...`;
             }
 
             const t =
-                (i / EXPORT_FRAME_COUNT) * Math.PI * 2;
+                (i / frameCount) * Math.PI * 2;
 
             let framePhi;
             let frameTheta;
@@ -3038,7 +4417,13 @@ async function exportLoopableGif() {
                 framePhi = startPhi + t * 2;
             }
 
+            bindSourceFrameAtElapsed(
+                (i / frameCount) * loopDurationMs
+            );
+
             instance.render({
+
+                ...p.uniforms,
 
                 phi: { type: "float", value: framePhi },
                 theta: { type: "float", value: frameTheta },
@@ -3072,10 +4457,21 @@ async function exportLoopableGif() {
                 0, 0, EXPORT_SIZE, EXPORT_SIZE
             );
 
-            const frameData =
+            const frameImageData =
                 exportCtx.getImageData(
                     0, 0, EXPORT_SIZE, EXPORT_SIZE
-                ).data;
+                );
+
+            // Soften the upcoming 1-bit alpha cutoff (see
+            // ditherAlphaChannel) before quantizing.
+            ditherAlphaChannel(
+                frameImageData.data,
+                EXPORT_SIZE,
+                EXPORT_SIZE
+            );
+
+            const frameData =
+                frameImageData.data;
 
             const palette =
                 quantize(frameData, 256, {
@@ -3095,7 +4491,7 @@ async function exportLoopableGif() {
                 EXPORT_SIZE,
                 {
                     palette,
-                    delay: EXPORT_FRAME_DELAY_MS,
+                    delay: frameDelayMs,
                     transparent: transparentIndex >= 0,
                     transparentIndex: Math.max(0, transparentIndex),
                     first: i === 0,
@@ -3165,6 +4561,12 @@ async function exportLoopableGif() {
         // then let the normal loop take back over.
         phi = startPhi;
         theta = startTheta;
+
+        // bindSourceFrameAtElapsed may have left a different source
+        // frame bound than the live loop's own animatedGifFrameIndex
+        // (which export never touched) - re-sync texture unit 0 to
+        // it now.
+        bindActiveAnimatedFrame();
 
         isExportingGif = false;
 
