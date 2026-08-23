@@ -7,6 +7,7 @@
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
+    <button type="button" id="sidebarToggle" title="Show/hide controls">&#9776;</button>
     <div class="container">
         <div class="controls">
             <div class="control-group">
@@ -80,23 +81,28 @@
             <div class="control-group">
                 <label>Phi:</label>
                 <input type="range" id="phi" min="0" max="6.28" step="0.01" value="0">
+                <span class="slider-value" id="phiValue"></span>
             </div>
             <div class="control-group">
                 <label>Theta:</label>
                 <input type="range" id="theta" min="0" max="6.28" step="0.01" value="0">
+                <span class="slider-value" id="thetaValue"></span>
             </div>
             <div class="control-group">
                 <label>Dot Count:</label>
                 <input type="range" id="dots" min="1000" max="100000" step="1000" value="25000">
+                <span class="slider-value" id="dotsValue"></span>
             </div>
             <div class="control-group">
                 <label>Scale:</label>
-                <input type="range" id="scale" min="0.5" max="1.5" step="0.05" value="1.0">
+                <input type="range" id="scale" min="0.05" max="8" step="0.05" value="1.0">
+                <span class="slider-value" id="scaleValue"></span>
             </div>
 
             <div class="control-group">
                 <label for="spinSpeed">Spin speed:</label>
                 <input type="range" id="spinSpeed" min="0" max="3" step="0.05" value="1">
+                <span class="slider-value" id="spinSpeedValue"></span>
             </div>
 
             <div class="control-group">
@@ -107,6 +113,7 @@
             <div class="control-group">
                 <label for="opacity">Opacity:</label>
                 <input type="range" id="opacity" min="0" max="1" step="0.01" value="1">
+                <span class="slider-value" id="opacityValue"></span>
             </div>
 
             <div class="control-group checkbox-row">
@@ -117,13 +124,25 @@
             <div class="control-group" id="faceSizeGroup" style="display: none;">
                 <label for="faceSize">Face size:</label>
                 <input type="range" id="faceSize" min="0.5" max="1.5" step="0.05" value="1">
+                <span class="slider-value" id="faceSizeValue"></span>
             </div>
 
             <div class="control-group export-group">
-                <button type="button" id="sphereFieldBtn">Sphere Field (many spheres)</button>
+                <button type="button" id="sphereFieldBtn">Spawn a Sphere</button>
                 <button type="button" id="exportGifBtn">Export Loopable GIF</button>
                 <button type="button" id="exportWebmBtn">Export Video (WebM)</button>
                 <div id="exportStatus" class="export-status"></div>
+            </div>
+
+            <!-- Shown only while Sphere Field mode is active and a sphere
+                 is selected - the sidebar's other controls then drive
+                 THAT sphere instead of the main globe. -->
+            <div class="control-group field-selection-group" id="fieldSelectionGroup" style="display: none;">
+                <div class="selected-sphere-label" id="selectedSphereLabel">No sphere selected</div>
+                <button type="button" id="moveModeBtn">Move Mode: OFF</button>
+                <button type="button" id="deleteSphereBtn">Delete Selected Sphere</button>
+                <button type="button" id="backToSingleBtn">Back to Single Sphere</button>
+                <div class="move-help">Drag = spin &middot; Shift+drag or Move mode + drag = move sphere &middot; Double-click = add image &middot; Del = delete</div>
             </div>
         </div>
         <div class="globe-container">

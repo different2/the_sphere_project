@@ -626,6 +626,10 @@ const fragmentShader = /*glsl*/`
                     texture2D(uFaceTex5, vec2(lx, ly));
             }
 
+            if (uIgnoreAlpha > 0.5) {
+                sampled.a = 1.0;
+            }
+
             if (sampled.a > 0.0) {
                 return sampled;
             }
@@ -645,8 +649,16 @@ const fragmentShader = /*glsl*/`
             uResolution.xy;
 
 
+        /*
+         * Center the UVs: [0,1] -> [-1,1]. The old "uv * 1.0 - 1.0"
+         * mapped [0,1] to [-1,0], pinning the globe's center at the
+         * bottom-left corner - it only ever looked centered on the
+         * main globe because uResolution was passed CSS pixels on a
+         * dpr=2 display, making gl_FragCoord/uResolution span [0,2]
+         * and the *2 error cancel out.
+         */
         uv =
-            uv * 1.0 -
+            uv * 2.0 -
             1.0;
 
 
@@ -668,6 +680,10 @@ const fragmentShader = /*glsl*/`
         }
 
 
+        // Scale has no upper/lower clamp - the slider spans 0.05x
+        // (tiny) to 8x (huge). The shader divides UVs directly, so
+        // any positive value renders; only 0 or negative would
+        // break the math, and those can't come from the range input.
         uv /=
             (scale * 0.8);
 
@@ -1185,13 +1201,21 @@ const fragmentShader = /*glsl*/`
         }
 
 
+        /*
+         * Globe edge glow, faded by the Opacity slider. Previously
+         * this glow was added at full strength regardless of
+         * opacity, which made an opacity-0 sphere render as a
+         * floating dim ring instead of disappearing entirely.
+         */
         gl_FragColor =
             color +
             vec4(
                 glowFactor *
+                opacity *
                 glowColor,
 
-                glowFactor
+                glowFactor *
+                opacity
             );
     }
 `;

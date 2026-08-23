@@ -17,7 +17,27 @@ import { parseGIF, decompressFrames } from './vendor/gifuct.esm.js';
 import {
     openSphereField,
     spawnSphereAt,
-    clearFieldSpheres
+    clearFieldSpheres,
+    closeSphereField,
+    selectSphere,
+    getSelectedSphere,
+    deleteSphere,
+    onSelectionChanged,
+    loadFileOntoFieldSphere,
+    setMoveMode,
+    isMoveMode,
+    setSphereDots,
+    setSphereScale,
+    setSphereGlowColor,
+    setSphereOpacity,
+    setSphereIgnoreAlpha,
+    setSpherePaused,
+    setSphereSpinType,
+    setSphereSpinSpeed,
+    setSpherePhi,
+    setSphereTheta,
+    setSphereUseDots,
+    getSphereControls
 } from './sphere-field.js';
 
 const vertexShader = `
@@ -87,6 +107,76 @@ let faceSizeMultiplier = 1.0;
 // Count control knows what to regenerate from when it changes.
 // 'image' | 'text' | null
 let activeCustomKind = null;
+
+// ============================================================
+// Debug logging + dropdown sync helpers
+//
+// debugLog is off by default (?debug=1 in the URL or
+// localStorage.globeDebug = '1' turns it on). It records routing
+// decisions and guard exits so "nothing happened" bugs point at the
+// exact line where the flow bailed, without spamming the console
+// during normal use.
+// ============================================================
+
+const DEBUG_ENABLED =
+    new URLSearchParams(window.location.search).has('debug') ||
+    window.localStorage.getItem('globeDebug') === '1';
+
+function debugLog(...args) {
+
+    if (!DEBUG_ENABLED) {
+        return;
+    }
+
+    console.log('[debug]', ...args);
+}
+
+// Surface async failures that would otherwise vanish silently.
+window.addEventListener(
+    'unhandledrejection',
+    (e) => {
+
+        console.error(
+            '[Unhandled promise rejection]',
+            e.reason
+        );
+    }
+);
+
+window.addEventListener(
+    'error',
+    (e) => {
+
+        console.error(
+            '[Uncaught error]',
+            e.message,
+            e.filename ? `${e.filename}:${e.lineno}` : ''
+        );
+    }
+);
+
+// Keeps the Texture dropdown's displayed value in sync with what the
+// globe is actually showing. Upload paths change the globe WITHOUT
+// moving the dropdown, so the select could sit on a stale value -
+// and re-picking that same value then fired no change event at all,
+// which looked like "the dropdown does nothing".
+// NOTE: references `textureSelect`, declared further down; only ever
+// called from event handlers, i.e. after this module has evaluated.
+function syncTextureSelect(value) {
+
+    if (!textureSelect) {
+        return;
+    }
+
+    if (textureSelect.value !== value) {
+
+        debugLog(
+            `syncTextureSelect: '${textureSelect.value}' -> '${value}'`
+        );
+
+        textureSelect.value = value;
+    }
+}
 
 // Cached per-face source images for the currently active custom image
 // upload, so switching Face Count or editing a single face doesn't
@@ -220,19 +310,27 @@ function resizeCanvas() {
     const width = window.innerWidth;
     const height = window.innerHeight;
 
-    canvas.width = width;
-    canvas.height = height;
-
+    // CSS layout size only - the DRAWING BUFFER is owned by
+    // Phenomenon's own resize handler (client size x
+    // devicePixelRatio). Setting canvas.width/height here as well
+    // made the two handlers fight over the buffer size, leaving
+    // uResolution and gl_FragCoord in different coordinate spaces
+    // depending on which handler ran last.
     canvas.style.width = width + 'px';
     canvas.style.height = height + 'px';
 
     if (p && p.gl) {
-        p.gl.viewport(0, 0, width, height);
+        p.gl.viewport(0, 0, p.gl.drawingBufferWidth, p.gl.drawingBufferHeight);
 
         if (instance) {
+            // Always the true buffer size, matching gl_FragCoord's
+            // space exactly (same convention as sphere-field.js).
             p.uniforms.uResolution = {
                 type: "vec2",
-                value: [width, height]
+                value: [
+                    p.gl.drawingBufferWidth,
+                    p.gl.drawingBufferHeight
+                ]
             };
         }
     }
@@ -1142,6 +1240,12 @@ async function loadTexture(
             "Texture loaded successfully"
         );
 
+        debugLog(
+            `loadTexture outcome: bound texture to unit 0, ` +
+            `${texture.image ? `${texture.image.width}x${texture.image.height}` : 'size n/a'}, ` +
+            `uUseDots=${useDots}, uUseFaces=${faceCompositeActive ? 1 : 0}`
+        );
+
     } catch (error) {
 
         console.error(
@@ -1881,6 +1985,12 @@ async function applyAnimatedGif(arrayBuffer) {
 
     activeCustomKind = 'image';
 
+    syncTextureSelect('custom');
+
+    debugLog(
+        "applyAnimatedGif: whole-globe GIF path (clears face slots)"
+    );
+
     rawCustomImages = {};
 
     if (uploadStatus) {
@@ -2099,10 +2209,11 @@ function clearAllFaceSlots() {
 function updateFaceComposite() {
 
     if (!p || !p.gl || !instance) {
+
+        debugLog("updateFaceComposite: skipped - globe not ready yet");
+
         return;
     }
-
-    // Nothing left in any slot -> leave composite mode entirely. The
     // CPU-baked texture that was showing before this mode began is
     // still bound, so the globe just falls back to it seamlessly.
     let used = 0;
@@ -2116,6 +2227,20 @@ function updateFaceComposite() {
         activeCustomKind !== 'image' ||
         faceCount === 1
     ) {
+
+        if (faceCompositeActive || used > 0) {
+
+            const reason =
+                used === 0 ?
+                    "no slots have content" :
+                    activeCustomKind !== 'image' ?
+                        `activeCustomKind='${activeCustomKind}' (not image)` :
+                        `faceCount=${faceCount}`;
+
+            debugLog(
+                `updateFaceComposite: deactivating - ${reason}`
+            );
+        }
 
         deactivateFaceComposite();
 
@@ -2357,6 +2482,32 @@ function getFaceSlotCurrentTexture(index) {
 async function applyFaceSlotGif(arrayBuffer, index) {
 
     if (!p || !p.gl) {
+
+        debugLog("applyFaceSlotGif: skipped - globe not ready yet");
+
+        return;
+    }
+
+    // ------------------------------------------------------------
+    // Composite mode only displays while an uploaded IMAGE is active
+    // AND faceCount > 1. From any other state (e.g. Laughing Man),
+    // a GIF dropped into a face slot used to decode and bake fully
+    // here, only to be discarded by updateFaceComposite - "Per-face
+    // GIF loaded" in the console while the screen kept showing the
+    // old texture. Route those to the whole-globe animated-GIF
+    // pipeline, the only mode that can actually display them.
+    // ------------------------------------------------------------
+    if (activeCustomKind !== 'image' || faceCount <= 1) {
+
+        debugLog(
+            `applyFaceSlotGif: not in multi-face image mode ` +
+            `(activeCustomKind='${activeCustomKind}', ` +
+            `faceCount=${faceCount}) - routing slot ${index} ` +
+            `upload through whole-globe GIF pipeline`
+        );
+
+        await applyAnimatedGif(arrayBuffer);
+
         return;
     }
 
@@ -2486,6 +2637,12 @@ async function applyFaceSlotGif(arrayBuffer, index) {
             `Per-face GIF loaded on face ${index}: ${bakedFrames.length} frame(s)`
         );
 
+        debugLog(
+            `outcome: faceSlotContent[${index}]=gif(${bakedFrames.length}f), ` +
+            `uUseFaces=${faceCompositeActive ? 1 : 0}, ` +
+            `activeCustomKind='${activeCustomKind}'`
+        );
+
     } catch (error) {
 
         console.error(
@@ -2515,6 +2672,9 @@ async function applyFaceSlotGif(arrayBuffer, index) {
 async function applyFaceSlotImage(image, index) {
 
     if (!p || !p.gl) {
+
+        debugLog("applyFaceSlotImage: skipped - globe not ready yet");
+
         return;
     }
 
@@ -2546,6 +2706,11 @@ async function applyFaceSlotImage(image, index) {
     bindFaceCompositeFrames();
 
     renderFaceSlotThumbnails();
+
+    debugLog(
+        `outcome: faceSlotContent[${index}]=image ` +
+        `(${image.width}x${image.height}), uUseFaces=${faceCompositeActive ? 1 : 0}`
+    );
 }
 
 // ============================================================
@@ -2566,6 +2731,13 @@ async function applyCustomImage(image, faceIndex = 0) {
     clearAnimatedGif();
 
     activeCustomKind = 'image';
+
+    syncTextureSelect('custom');
+
+    debugLog(
+        `applyCustomImage: whole-globe static path ` +
+        `(${image.width}x${image.height})`
+    );
 
     rawCustomImages = {
         0: image
@@ -2697,6 +2869,8 @@ function setUseDots(on) {
 
     useDots = on ? 1 : 0;
 
+    debugLog(`setUseDots: ${on ? 'on' : 'off'}`);
+
     if (useDotsToggle) {
         useDotsToggle.checked = on;
     }
@@ -2795,9 +2969,14 @@ async function createGlobe() {
 
                     uResolution: {
                         type: "vec2",
+                        // True drawing-buffer size (CSS x dpr),
+                        // matching gl_FragCoord's space. Passing CSS
+                        // pixels here only worked on dpr=2 displays,
+                        // where the 2x error cancelled the shader's
+                        // uv*1.0-1.0 mapping.
                         value: [
-                            width,
-                            height
+                            canvas.width,
+                            canvas.height
                         ]
                     },
 
@@ -3057,8 +3236,8 @@ window.addEventListener(
                 type: "vec2",
 
                 value: [
-                    window.innerWidth,
-                    window.innerHeight
+                    p.gl.drawingBufferWidth,
+                    p.gl.drawingBufferHeight
                 ]
 
             };
@@ -3309,10 +3488,20 @@ if (phiControl) {
         'input',
         (e) => {
 
-            phi =
+            const v =
                 parseFloat(
                     e.target.value
                 );
+
+            // Field mode with a selection: drive that sphere.
+            const target = fieldTarget();
+
+            if (target) {
+                setSpherePhi(target, v);
+                return;
+            }
+
+            phi = v;
 
         }
     );
@@ -3327,10 +3516,19 @@ if (thetaControl) {
         'input',
         (e) => {
 
-            theta =
+            const v =
                 parseFloat(
                     e.target.value
                 );
+
+            const target = fieldTarget();
+
+            if (target) {
+                setSphereTheta(target, v);
+                return;
+            }
+
+            theta = v;
 
         }
     );
@@ -3345,10 +3543,19 @@ if (dotsControl) {
         'input',
         (e) => {
 
-            dots =
+            const v =
                 parseFloat(
                     e.target.value
                 );
+
+            const target = fieldTarget();
+
+            if (target) {
+                setSphereDots(target, v);
+                return;
+            }
+
+            dots = v;
 
         }
     );
@@ -3363,10 +3570,19 @@ if (scaleControl) {
         'input',
         (e) => {
 
-            scale =
+            const v =
                 parseFloat(
                     e.target.value
                 );
+
+            const target = fieldTarget();
+
+            if (target) {
+                setSphereScale(target, v);
+                return;
+            }
+
+            scale = v;
 
         }
     );
@@ -3389,8 +3605,17 @@ if (spinSpeedControl) {
         'input',
         (e) => {
 
-            spinSpeedMultiplier =
+            const v =
                 parseFloat(e.target.value);
+
+            const target = fieldTarget();
+
+            if (target) {
+                setSphereSpinSpeed(target, v);
+                return;
+            }
+
+            spinSpeedMultiplier = v;
 
         }
     );
@@ -3418,9 +3643,17 @@ if (glowColorControl) {
         'input',
         (e) => {
 
+            const rgb = hexToRgb01(e.target.value);
+
+            const target = fieldTarget();
+
+            if (target) {
+                setSphereGlowColor(target, rgb);
+                return;
+            }
+
             if (instance && instance.uniforms.glowColor) {
-                instance.uniforms.glowColor.value =
-                    hexToRgb01(e.target.value);
+                instance.uniforms.glowColor.value = rgb;
             }
 
         }
@@ -3440,9 +3673,18 @@ if (opacityControl) {
         'input',
         (e) => {
 
+            const v =
+                parseFloat(e.target.value);
+
+            const target = fieldTarget();
+
+            if (target) {
+                setSphereOpacity(target, v);
+                return;
+            }
+
             if (instance && instance.uniforms.opacity) {
-                instance.uniforms.opacity.value =
-                    parseFloat(e.target.value);
+                instance.uniforms.opacity.value = v;
             }
 
         }
@@ -3466,6 +3708,13 @@ if (ignoreAlphaToggle) {
     ignoreAlphaToggle.addEventListener(
         'change',
         (e) => {
+
+            const target = fieldTarget();
+
+            if (target) {
+                setSphereIgnoreAlpha(target, e.target.checked);
+                return;
+            }
 
             if (instance && instance.uniforms.uIgnoreAlpha) {
                 instance.uniforms.uIgnoreAlpha.value =
@@ -3687,8 +3936,17 @@ if (useDotsToggle) {
         'change',
         (e) => {
 
-            useDots =
+            const v =
                 e.target.checked ? 1 : 0;
+
+            const target = fieldTarget();
+
+            if (target) {
+                setSphereUseDots(target, v);
+                return;
+            }
+
+            useDots = v;
 
         }
     );
@@ -3707,8 +3965,16 @@ if (spinTypeControl) {
         'change',
         (e) => {
 
-            spinType =
-                e.target.value;
+            const v = e.target.value;
+
+            const target = fieldTarget();
+
+            if (target) {
+                setSphereSpinType(target, v);
+                return;
+            }
+
+            spinType = v;
 
             if (spinType === 'axis') {
 
@@ -3741,6 +4007,13 @@ if (pauseSpinToggle) {
     pauseSpinToggle.addEventListener(
         'change',
         (e) => {
+
+            const target = fieldTarget();
+
+            if (target) {
+                setSpherePaused(target, e.target.checked);
+                return;
+            }
 
             isPaused =
                 e.target.checked;
@@ -3970,7 +4243,38 @@ if (faceSlotsContainer) {
                     return;
                 }
 
+                // ------------------------------------------------
+                // Field mode with a selected sphere: per-face
+                // uploads go to THAT sphere as its whole-sphere
+                // texture (field spheres don't have faces).
+                // ------------------------------------------------
+                const fieldSphereTarget = fieldTarget();
+
+                if (fieldSphereTarget) {
+
+                    lastUploadedFileName = file.name;
+
+                    debugLog(
+                        `per-face slot ${i} upload routed: field sphere ` +
+                        `${fieldSphereTarget.id || '(selected)'} (${file.type})`
+                    );
+
+                    loadFileOntoFieldSphere(
+                        fieldSphereTarget,
+                        file
+                    ).then(showUploadStatusIdle);
+
+                    e.target.value = '';
+
+                    return;
+                }
+
                 lastUploadedFileName = file.name;
+
+                debugLog(
+                    `per-face slot ${i} upload routed: main globe ` +
+                    `(${file.type}, activeCustomKind='${activeCustomKind}', faceCount=${faceCount})`
+                );
 
                 // ------------------------------------------------
                 // Animated GIF -> this face's own independent
@@ -4166,6 +4470,12 @@ if (
 
                 activeCustomKind = 'image';
 
+                syncTextureSelect('custom');
+
+                debugLog(
+                    "textureSelect: custom mode - upload/faces controls shown"
+                );
+
                 setContextualControlsVisible({
                     upload: true,
                     faces: true
@@ -4197,6 +4507,12 @@ if (
             ) {
 
                 activeCustomKind = 'text';
+
+                syncTextureSelect('text');
+
+                debugLog(
+                    "textureSelect: text mode"
+                );
 
                 setContextualControlsVisible({
                     text: true,
@@ -4241,6 +4557,8 @@ if (
                 'laughingMan'
             ) {
 
+                syncTextureSelect('laughingMan');
+
                 await loadLaughingMan();
 
                 return;
@@ -4255,6 +4573,10 @@ if (
                     selectedTexture
                 ]
             ) {
+
+                debugLog(
+                    `textureSelect: loading preset '${selectedTexture}'`
+                );
 
                 setUseDots(true);
 
@@ -4294,6 +4616,47 @@ if (fileUpload) {
                 return;
             }
 
+            // ------------------------------------------------
+            // Field mode with a selected sphere: the image goes
+            // to THAT sphere, bypassing the main-globe pipeline
+            // entirely.
+            // ------------------------------------------------
+            const fieldSphereTarget = fieldTarget();
+
+            if (fieldSphereTarget) {
+
+                if (!file.type.startsWith('image/')) {
+
+                    alert(
+                        "Please select an image file."
+                    );
+
+                    e.target.value = '';
+
+                    return;
+                }
+
+                lastUploadedFileName = file.name;
+
+                debugLog(
+                    `upload routed: field sphere ${fieldSphereTarget.id || '(selected)'}` +
+                    ` (${file.type})`
+                );
+
+                loadFileOntoFieldSphere(
+                    fieldSphereTarget,
+                    file
+                ).then(showUploadStatusIdle);
+
+                e.target.value = '';
+
+                return;
+            }
+
+            debugLog(
+                `upload routed: main globe pipeline (${file.type})`
+            );
+
             console.log(
                 "Selected file:",
                 file.name,
@@ -4325,6 +4688,36 @@ if (fileUpload) {
             // finishes (see showUploadStatusIdle) - the <input>'s own
             // "chosen file" text gets reset below, in both branches.
             lastUploadedFileName = file.name;
+
+            // ------------------------------------------------
+            // In field mode with a selected sphere, the upload goes
+            // to THAT sphere (via its own full-wrap bake), not the
+            // main globe.
+            // ------------------------------------------------
+
+            const target = fieldTarget();
+
+            if (target) {
+
+                const reader =
+                    new FileReader();
+
+                reader.onload =
+                    function(event) {
+
+                        loadFileOntoFieldSphere(
+                            target,
+                            file
+                        );
+
+                    };
+
+                reader.readAsArrayBuffer(file);
+
+                e.target.value = '';
+
+                return;
+            }
 
             // ------------------------------------------------
             // Animated GIF - separate pipeline (see
@@ -4964,12 +5357,239 @@ const exportWebmBtn =
     document.getElementById('exportWebmBtn');
 
 // ------------------------------------------------------------
+// ------------------------------------------------------------
+// Slider value readouts - human-friendly units next to each slider.
+// Phi/Theta in degrees (movement angles), dots as plain counts,
+// everything else as multipliers/percentages.
+// ------------------------------------------------------------
+
+function formatSliderValue(id, v) {
+
+    switch (id) {
+
+        case 'phi':
+        case 'theta':
+            // 0..6.28 rad -> 0..360 degrees
+            return `${Math.round(v * 180 / Math.PI)}\u00B0`;
+
+        case 'dots':
+            return `${Math.round(v)}`;
+
+        case 'scale':
+            return `${v.toFixed(2)}x`;
+
+        case 'spinSpeed':
+            return `${v.toFixed(2)}x`;
+
+        case 'opacity':
+            return `${Math.round(v * 100)}%`;
+
+        case 'faceSize':
+            return `${v.toFixed(2)}x`;
+
+        default:
+            return v.toFixed(2);
+    }
+}
+
+const SLIDER_LABEL_IDS = [
+    'phi',
+    'theta',
+    'dots',
+    'scale',
+    'spinSpeed',
+    'opacity',
+    'faceSize'
+];
+
+for (const id of SLIDER_LABEL_IDS) {
+
+    const input =
+        document.getElementById(id);
+
+    const label =
+        document.getElementById(`${id}Value`);
+
+    if (!input || !label) {
+        continue;
+    }
+
+    const update = () => {
+        label.textContent =
+            formatSliderValue(id, parseFloat(input.value));
+    };
+
+    input.addEventListener('input', update);
+
+    // Initial paint
+    update();
+}
+
+// ------------------------------------------------------------
+// Collapsible sidebar - the hamburger button slides the control
+// panel off-screen so it never covers spheres in field mode.
+// ------------------------------------------------------------
+
+const controlsPanel =
+    document.querySelector('.controls');
+
+const sidebarToggle =
+    document.getElementById('sidebarToggle');
+
+if (controlsPanel && sidebarToggle) {
+
+    sidebarToggle.addEventListener(
+        'click',
+        () => {
+            controlsPanel.classList.toggle('collapsed');
+        }
+    );
+}
+
 // Sphere Field mode - full-screen surface with many independent
-// spheres (see sphere-field.js). The main sidebar keeps controlling
-// the primary globe underneath.
+// spheres (see sphere-field.js). Clicking a sphere selects it; the
+// sidebar's spin/glow/scale/etc controls then drive THAT sphere
+// instead of the main globe.
 // ------------------------------------------------------------
 const sphereFieldBtn =
     document.getElementById('sphereFieldBtn');
+
+const fieldSelectionGroup =
+    document.getElementById('fieldSelectionGroup');
+
+const selectedSphereLabel =
+    document.getElementById('selectedSphereLabel');
+
+const deleteSphereBtn =
+    document.getElementById('deleteSphereBtn');
+
+const backToSingleBtn =
+    document.getElementById('backToSingleBtn');
+
+// Move mode toggle button - makes sphere repositioning discoverable
+// (the M key still works too).
+const moveModeBtn =
+    document.getElementById('moveModeBtn');
+
+if (moveModeBtn) {
+
+    moveModeBtn.addEventListener(
+        'click',
+        () => {
+
+            const on = !isMoveMode();
+
+            setMoveMode(on);
+
+            moveModeBtn.textContent =
+                `Move Mode: ${on ? 'ON' : 'OFF'}`;
+
+            moveModeBtn.classList.toggle('move-on', on);
+
+            console.log(
+                `move mode turned ${on ? 'ON' : 'OFF'} (drag now ${on ? 'moves' : 'spins'} spheres)`
+            );
+        }
+    );
+}
+
+// Keep the button label in sync when Move mode is toggled with the
+// keyboard.
+window.addEventListener(
+    'keydown',
+    (e) => {
+
+        if (
+            (e.key === 'm' || e.key === 'M') &&
+            moveModeBtn &&
+            !/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName)
+        ) {
+
+            // The keydown handler in sphere-field.js flips the mode;
+            // read the new state after it runs (bubbled listener).
+            setTimeout(() => {
+                const on = isMoveMode();
+                moveModeBtn.textContent =
+                    `Move Mode: ${on ? 'ON' : 'OFF'}`;
+                moveModeBtn.classList.toggle('move-on', on);
+            }, 0);
+        }
+    }
+);
+
+// Counter for the "Spawn a Sphere" button - spreads new spheres
+// around instead of stacking them on one spot.
+let fieldSpawnOffset = 0;
+
+// True while Sphere Field mode is open AND a sphere is selected -
+// routes every sidebar control change into that sphere instead of
+// the main globe's uniforms/variables.
+function fieldTarget() {
+
+    return (
+        document.getElementById('sphereField')
+            .classList.contains('active') &&
+        getSelectedSphere()
+    ) ? getSelectedSphere() : null;
+}
+
+if (deleteSphereBtn) {
+
+    deleteSphereBtn.addEventListener(
+        'click',
+        () => {
+
+            const s = getSelectedSphere();
+
+            if (s) {
+                deleteSphere(s);
+            }
+        }
+    );
+}
+
+if (backToSingleBtn) {
+
+    backToSingleBtn.addEventListener(
+        'click',
+        () => {
+            closeSphereField();
+        }
+    );
+}
+
+// Selection UI sync - shows/hides the Delete / Back buttons and the
+// "Sphere N" label whenever the selection changes.
+onSelectionChanged((sphere) => {
+
+    if (fieldSelectionGroup) {
+
+        const show =
+            document.getElementById('sphereField')
+                .classList.contains('active') &&
+            Boolean(sphere);
+
+        fieldSelectionGroup.style.display =
+            show ? 'block' : 'none';
+    }
+
+    if (selectedSphereLabel) {
+
+        selectedSphereLabel.textContent =
+            sphere ?
+                `Selected: Sphere ${sphere.id}` :
+                'No sphere selected';
+    }
+});
+
+function hexToRgb01(hex) {
+
+    const r = parseInt(hex.slice(1, 3), 16) / 255;
+    const g = parseInt(hex.slice(3, 5), 16) / 255;
+    const b = parseInt(hex.slice(5, 7), 16) / 255;
+
+    return [r, g, b];
+}
 
 if (sphereFieldBtn) {
 
@@ -4977,17 +5597,31 @@ if (sphereFieldBtn) {
         'click',
         () => {
 
-            openSphereField();
+            // Enters field mode on first use; every later press
+            // spawns ANOTHER sphere. Leaving field mode is done via
+            // the "Back to Single Sphere" button (or Escape).
+            const wasInactive = !document
+                .getElementById('sphereField')
+                .classList.contains('active');
 
-            // Seed the field with a small starter cluster so it
-            // doesn't open empty - users add more by double-clicking
-            // empty space, or drag images straight onto a sphere.
+            if (wasInactive) {
+                openSphereField();
+            }
+
+            // New spheres appear near the middle, offset so repeated
+            // clicks don't stack them exactly on top of each other.
             const w = window.innerWidth;
             const h = window.innerHeight;
 
-            spawnSphereAt(w * 0.3, h * 0.4, 170);
-            spawnSphereAt(w * 0.55, h * 0.6, 130);
-            spawnSphereAt(w * 0.72, h * 0.35, 100);
+            const n = fieldSpawnOffset++;
+            const angle = n * 2.4; // golden-angle-ish spread
+            const radius = 90 + (n % 4) * 70;
+
+            spawnSphereAt(
+                w * 0.42 + Math.cos(angle) * radius,
+                h * 0.45 + Math.sin(angle) * radius,
+                150
+            );
         }
     );
 }

@@ -47,6 +47,35 @@ html, body {
             backdrop-filter: blur(10px);
             border: 1px solid rgba(255, 255, 255, 0.1);
             box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+            transition: opacity 0.2s ease-out, transform 0.2s ease-out;
+        }
+
+        /* Collapsed state - slid out of view; the hamburger button
+           stays visible to bring it back. */
+        .controls.collapsed {
+            opacity: 0;
+            transform: translateY(-50%) translateX(120%);
+            pointer-events: none;
+        }
+
+        #sidebarToggle {
+            position: fixed;
+            top: 14px;
+            right: 14px;
+            z-index: 101;
+            width: 34px;
+            height: 34px;
+            border-radius: 8px;
+            border: 1px solid rgba(255, 255, 255, 0.25);
+            background: rgba(6, 0, 128, 0.85);
+            color: white;
+            font-size: 16px;
+            line-height: 1;
+            cursor: pointer;
+        }
+
+        #sidebarToggle:hover {
+            background: rgba(77, 166, 255, 0.45);
         }
 
         .controls::-webkit-scrollbar {
@@ -258,13 +287,136 @@ html, body {
 
         .field-sphere {
             position: absolute;
-            border-radius: 50%;
+            /* NO border-radius here - the fragment shader draws the
+               full orb (globe disc + outer glow) against transparency.
+               A CSS circle clip would cut the glow off at the canvas
+               edge, producing a broken crescent instead of one
+               complete sphere. */
             cursor: pointer;
             transition: box-shadow 0.2s ease-out;
+
+            /* Keep pointer events flowing for sphere dragging - the
+               browser otherwise cancels them to scroll/zoom on
+               touch devices, which also invalidates the pointerId
+               mid-gesture. */
+            touch-action: none;
         }
 
         .field-sphere:hover {
-            box-shadow: 0 0 24px rgba(120, 200, 255, 0.8);
+            filter: drop-shadow(0 0 12px rgba(120, 200, 255, 0.6));
+        }
+
+        /* Selected sphere - a small FIXED-SIZE badge ring so it's
+           obvious which sphere is selected.
+
+           The canvas is intentionally a square (it's the GL drawing
+           surface; the shader draws a round disc inside it against
+           transparency - nothing is visually square). The marker
+           does NOT scale with the sphere: it surrounds the disc
+           (blue) while the disc is small, and once the sphere
+           outgrows the 36px badge, the badge stays 36px, sits ON
+           the sphere's face, and turns RED. Deselecting hides it. */
+        .field-sphere.selected::before {
+            content: '';
+            position: absolute;
+            left: 50%;
+            top: 50%;
+            width: var(--sel-size, 24px);
+            height: var(--sel-size, 24px);
+            transform: translate(-50%, -50%);
+            border: 2px solid rgba(120, 200, 255, 0.9);
+            border-radius: 50%;
+            pointer-events: none;
+        }
+
+        /* Sphere bigger than the badge: red ring on its face. */
+        .field-sphere.selected.marker-overflow::before {
+            border-color: rgba(255, 80, 80, 0.95);
+            background: rgba(255, 80, 80, 0.12);
+        }
+
+        .field-sphere.selected::after {
+            content: attr(data-label);
+            position: absolute;
+            top: -18px;
+            left: 50%;
+            transform: translateX(-50%);
+            font-size: 10px;
+            color: rgba(255, 255, 255, 0.95);
+            text-shadow: 0 0 3px #000, 0 0 4px #000;
+            pointer-events: none;
+        }
+
+        /* While Move mode (or shift) is held, dragging moves the
+           sphere instead of spinning it. */
+        .field-sphere.move-mode,
+        .field-sphere.force-move {
+            cursor: move;
+        }
+
+        .move-hint {
+            position: fixed;
+            bottom: 12px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 101;
+            padding: 6px 14px;
+            border-radius: 8px;
+            background: rgba(6, 0, 128, 0.85);
+            border: 1px solid rgba(255, 255, 255, 0.25);
+            color: white;
+            font-size: 11px;
+            pointer-events: none;
+        }
+
+        .field-selection-group button {
+            width: 100%;
+            background: rgba(77, 166, 255, 0.25);
+            color: white;
+            border: 1px solid rgba(77, 166, 255, 0.6);
+            border-radius: 6px;
+            padding: 8px 6px;
+            font-size: 12px;
+            cursor: pointer;
+            margin-top: 4px;
+        }
+
+        .field-selection-group button:hover:not(:disabled) {
+            background: rgba(77, 166, 255, 0.45);
+        }
+
+        .selected-sphere-label {
+            font-size: 11px;
+            min-height: 13px;
+            text-align: center;
+            color: rgba(255, 255, 255, 0.85);
+        }
+
+        /* Keyboard-shortcut / gesture cheat sheet under the field
+           selection buttons. */
+        .move-help {
+            margin-top: 8px;
+            font-size: 10px;
+            line-height: 1.5;
+            text-align: center;
+            color: rgba(255, 255, 255, 0.6);
+        }
+
+        #moveModeBtn.move-on {
+            background: rgba(255, 190, 60, 0.35);
+            border-color: rgba(255, 190, 60, 0.8);
+        }
+
+        /* Live value readouts next to each slider - degrees for
+           angles, plain counts for dots, multipliers elsewhere. */
+        .slider-value {
+            display: inline-block;
+            margin-left: 6px;
+            min-width: 52px;
+            font-size: 10px;
+            color: rgba(255, 255, 255, 0.75);
+            vertical-align: middle;
+            user-select: none;
         }
 
         .export-status {
