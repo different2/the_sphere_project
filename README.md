@@ -34,12 +34,17 @@ texture or as a Fibonacci-lattice dot pattern.
   on the sphere: **1** (wraps once around the whole globe, like a world
   map), **2** (front/back), **3** (spaced around the equator), **4** (same
   4 equatorial spots as the 3/6 layouts, no poles), or **6** (the original
-  Laughing Man layout: 4 equator + north/south poles).
+  Laughing Man layout: 4 equator + north/south poles). Also drives
+  whichever spawned sphere is currently selected in **Spawn a Sphere**
+  mode (see below) - each spawned sphere has its own independent Faces
+  setting, separate from the main globe's.
 - **Per-face** *(Upload Image mode, when Faces > 1)* - a small tile per
   face; click one to give that specific face its own image. Any face left
   untouched just uses the main uploaded image, so this is fully optional -
   upload once and every face matches, or override individual faces for a
   mixed look. Uploading a new main image resets any per-face overrides.
+  Same deal for a selected spawned sphere - its face tiles/overrides are
+  its own, independent of the main globe and every other spawned sphere.
 - **Fibonacci dots** - toggle between the dotted globe look and a crisp
   direct texture, independent of which texture/face count is active.
 - **Spin** - **Randomized** is the original tumbling dual-axis motion;
@@ -77,8 +82,23 @@ texture or as a Fibonacci-lattice dot pattern.
   on request - if you're merging this in, re-apply your own fix to
   `textures.js` for it.
 - Face counts other than 1/2/3/4/6 aren't supported yet, but
-  `getFaceCenters()` in `main.js` is the one place to extend if that's
-  ever needed - everything else just asks it "how many faces and where."
+  `getFaceCenters()` in `face-texture.js` is the one place to extend if
+  that's ever needed - everything else just asks it "how many faces and
+  where."
+- **Fixed:** spawned spheres (**Spawn a Sphere**) couldn't actually show
+  more than one image - every upload (whether the main image or a
+  per-face tile) just overwrote the whole sphere with a new full wrap,
+  so a second image always replaced the first instead of landing on its
+  own face, and the Faces/Per-face controls did nothing while a spawned
+  sphere was selected. The face-layout math (`getFaceCenters`,
+  `generateGlobeTexture`, etc.) was only ever reachable from `main.js`;
+  it's now pulled out into its own module, `face-texture.js`, that both
+  `main.js` and `sphere-field.js` import, so spawned spheres composite
+  per-face images the exact same way the main globe does. Also fixed a
+  related bug this surfaced: a static image uploaded onto a sphere that
+  was already showing a GIF never actually appeared, since the GIF's
+  last frame stayed bound for rendering even after `sphere.texture` was
+  updated underneath it.
 - Fixed a latent GLSL naming collision in `fragmentShader.js` (a local
   variable was named `sample`, which some GLSL compilers treat as a
   reserved word) - purely a rename, no behavior change.

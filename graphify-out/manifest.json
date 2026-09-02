@@ -1,0 +1,74 @@
+{
+  ".vscode/settings.json": {
+    "mtime": 1756596423.8644094,
+    "seen": 1788345721.829525,
+    "ast_hash": "8ab8729084acaaa571a2c5e90f13a6ef",
+    "semantic_hash": "8ab8729084acaaa571a2c5e90f13a6ef"
+  },
+  "face-texture.js": {
+    "mtime": 1788337722.4128258,
+    "seen": 1788345721.8295271,
+    "ast_hash": "27570355367d432f51daefca70a4cd34",
+    "semantic_hash": "27570355367d432f51daefca70a4cd34"
+  },
+  "fragmentShader.js": {
+    "mtime": 1787400787.0765853,
+    "seen": 1788345721.829528,
+    "ast_hash": "b32792dd43e61bc83e66a291c571004e",
+    "semantic_hash": "b32792dd43e61bc83e66a291c571004e"
+  },
+  "laughing-man-animation/make_ring_gif.py": {
+    "mtime": 1786856540.790031,
+    "seen": 1788345721.829528,
+    "ast_hash": "179b85316740197984c7b724fcfbc0d6",
+    "semantic_hash": "179b85316740197984c7b724fcfbc0d6"
+  },
+  "laughing-man-animation/reduce_gif.py": {
+    "mtime": 1786995111.7312071,
+    "seen": 1788345721.829528,
+    "ast_hash": "ac7cf5f3c292f15ce6ae5294a024d22b",
+    "semantic_hash": "ac7cf5f3c292f15ce6ae5294a024d22b"
+  },
+  "main.js": {
+    "mtime": 1788337695.972337,
+    "seen": 1788345721.829529,
+    "ast_hash": "8f51d5993747d729d38d2f1e9241b8cb",
+    "semantic_hash": "8f51d5993747d729d38d2f1e9241b8cb"
+  },
+  "phenomenon.js": {
+    "mtime": 1786501582.0,
+    "seen": 1788345721.829529,
+    "ast_hash": "4cf4e85a1075db3d029293ee7d94c2f1",
+    "semantic_hash": "4cf4e85a1075db3d029293ee7d94c2f1"
+  },
+  "sphere-field.js": {
+    "mtime": 1788337708.392182,
+    "seen": 1788345721.82953,
+    "ast_hash": "ad248fee5906009ed411937ef2ee9b88",
+    "semantic_hash": "ad248fee5906009ed411937ef2ee9b88"
+  },
+  "temp.js": {
+    "mtime": 1786501582.0,
+    "seen": 1788345721.82953,
+    "ast_hash": "19d969769d46c3f1d2c8b9767a428d06",
+    "semantic_hash": "19d969769d46c3f1d2c8b9767a428d06"
+  },
+  "textures.js": {
+    "mtime": 1786995989.0907202,
+    "seen": 1788345721.82953,
+    "ast_hash": "017250c0fab7b61708091c5ebde10868",
+    "semantic_hash": "017250c0fab7b61708091c5ebde10868"
+  },
+  "vendor/gifenc.esm.js": {
+    "mtime": 1786520808.0,
+    "seen": 1788345721.829531,
+    "ast_hash": "76024b5542face2b82309d80ebaa8174",
+    "semantic_hash": "76024b5542face2b82309d80ebaa8174"
+  },
+  "vendor/gifuct.esm.js": {
+    "mtime": 1786793903.0,
+    "seen": 1788345721.829531,
+    "ast_hash": "c7200636899b4ec0b72a494d7f886c40",
+    "semantic_hash": "c7200636899b4ec0b72a494d7f886c40"
+  }
+}

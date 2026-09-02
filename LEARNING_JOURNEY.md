@@ -29,6 +29,25 @@ version did, what problem it was wrestling with, and what carried forward.
 
 ---
 
+## Stage −1 — Before everything: the Cobe-via-Svelte dead end (Jan 2025)
+
+Months before any of the folders above, the actual first contact: found
+**Cobe** (shuding's 5KB WebGL globe) and its official **Svelte example**,
+which ran inside an online sandbox with its real dependencies tucked away in
+config panels. Created an empty SvelteKit scaffold (`Svelte/globe`,
+Jan 20, 2025) to try it locally — and then chased what was actually
+underneath instead. Discovery: **Cobe is just a thin wrapper around
+Phenomenon**, a low-level WebGL API. Downloaded Phenomenon's source three
+days later (`here-s-phenomenon/`, Jan 23, 2025), skipped both Cobe and
+Svelte entirely, and learned the underlying library directly.
+
+No code was ever written in that scaffold (it stayed stock boilerplate until
+deleted in Aug 2026) — but the detour set the whole route: Phenomenon study →
+particle experiments → raw WebGL below. Even the dot-globe look from Stage 0a
+was, unknown at the time, Phenomenon doing the rendering under Cobe.
+
+---
+
 ## Stage 0a — `experiment-cobe-library` (folder was `globe`, Aug 7)
 
 The very first thing that worked. This uses the **cobe** library (a npm

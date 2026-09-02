@@ -16,6 +16,14 @@
 // controls then drive that sphere (see the control bridge at the
 // bottom). Delete / Backspace removes it; Escape deselects.
 // Shift+drag (or Move mode, toggled with M) repositions a sphere.
+//
+// Each sphere also has its own Faces layout (1/2/3/4/6, same as the
+// main globe) and per-face image slots - see faceImages/faceCount
+// below and regenerateFieldSphereTexture(). Uploading a second image
+// (e.g. into a per-face slot via the sidebar while this sphere is
+// selected) bakes a real composite through the shared
+// generateGlobeTexture(), instead of the earlier behavior where every
+// upload just overwrote the whole sphere with a new full wrap.
 // ============================================================
 
 import {
@@ -24,6 +32,11 @@ import {
 } from './vendor/gifuct.esm.js';
 
 import fragmentShader from './fragmentShader.js';
+
+import {
+    getAngularRadiusForFaceCount,
+    generateGlobeTexture
+} from './face-texture.js';
 
 const field =
     document.getElementById('sphereField');
@@ -216,7 +229,14 @@ function createFieldSphere(x, y, size) {
         frameIndex: 0,
         elapsedMs: 0,
         lastTs: null,
-        controls: defaultSphereControls()
+        controls: defaultSphereControls(),
+        // Per-face static image sources (plain <img> elements),
+        // keyed by face slot index - 0 is the primary/main image,
+        // same convention as main.js's rawCustomImages. Rebuilt into
+        // a single composite texture by regenerateFieldSphereTexture
+        // whenever a face's image changes or faceCount changes.
+        faceImages: {},
+        faceCount: 1
     };
 
     // --------------------------------------------------------
@@ -536,17 +556,150 @@ function deleteSphere(sphere) {
     sphere.el.remove();
 }
 
+// Frees the GL textures backing sphere.frames (if any) and clears
+// it. Split out since both a fresh GIF-as-primary upload and a
+// switch into face-composite mode need to stop/discard whatever
+// animation was previously playing.
+function disposeFieldSphereFrames(sphere) {
+
+    if (sphere.frames) {
+
+        for (const f of sphere.frames) {
+            sphere.gl.deleteTexture(f.texture);
+        }
+
+        sphere.frames = null;
+    }
+}
+
+// Stores `source` (an <img> or <canvas>) as face slot `faceIndex` on
+// `sphere` and rebuilds its composite texture from every face slot
+// currently set - this is what makes different images actually land
+// on different sides of the sphere instead of each upload just
+// replacing the last one (see regenerateFieldSphereTexture below).
+//
+// A new primary image (faceIndex 0) drops any other face overrides
+// and stops GIF playback - the same "start over" rule main.js's
+// applyCustomImage uses for the main globe's primary image.
+function setFaceImage(sphere, faceIndex, source) {
+
+    if (faceIndex === 0) {
+        sphere.faceImages = {};
+        disposeFieldSphereFrames(sphere);
+    }
+
+    sphere.faceImages[faceIndex] = source;
+
+    regenerateFieldSphereTexture(sphere);
+}
+
+// Rebuilds a field sphere's texture from its current faceImages +
+// faceCount via the shared generateGlobeTexture() (same per-face
+// gnomonic-projection compositing the main globe uses). Un-set face
+// slots resolve to the lowest-indexed slot that DOES have an image,
+// so e.g. uploading only to slots 1 and 3 of a 4-face sphere fills
+// 2 and 4 with slot 1's image rather than leaving them blank.
+function regenerateFieldSphereTexture(sphere) {
+
+    const slotIndices =
+        Object.keys(sphere.faceImages).map(Number);
+
+    if (slotIndices.length === 0) {
+
+        // Nothing uploaded yet (e.g. Faces was changed before any
+        // image exists on this sphere) - nothing to render.
+        return;
+    }
+
+    const fallbackSlot =
+        Math.min(...slotIndices);
+
+    const faceCount =
+        sphere.faceCount || 1;
+
+    const angularRadius =
+        getAngularRadiusForFaceCount(faceCount);
+
+    let source;
+
+    if (faceCount === 1) {
+
+        source =
+            sphere.faceImages[0] ||
+            sphere.faceImages[fallbackSlot];
+
+    } else {
+
+        source = [];
+
+        for (let i = 0; i < faceCount; i++) {
+
+            source.push(
+                sphere.faceImages[i] ||
+                sphere.faceImages[fallbackSlot]
+            );
+        }
+    }
+
+    // Field spheres bake at 1024x512 (vs. the main globe's 2048x1024)
+    // - keeps per-sphere GPU memory modest, since up to 9 of these
+    // WebGL contexts can be active at once.
+    const canvas =
+        generateGlobeTexture(
+            source,
+            angularRadius,
+            1024,
+            faceCount
+        );
+
+    if (sphere.texture) {
+        sphere.gl.deleteTexture(sphere.texture);
+    }
+
+    sphere.texture =
+        uploadTex(sphere.gl, canvas);
+
+    disposeFieldSphereFrames(sphere);
+
+    renderFieldSphere(sphere, sphere.phi, sphere.theta);
+}
+
+// Changes how many faces a field sphere shows (1/2/3/4/6, same
+// options as the main globe) and rebakes its texture from whatever
+// face images are already set on it.
+function setSphereFaceCount(sphere, n) {
+
+    if (!sphere) return;
+
+    console.log(`sphere ${sphere.id}: faceCount = ${n}`);
+
+    sphere.faceCount = n;
+
+    regenerateFieldSphereTexture(sphere);
+}
+
 // ------------------------------------------------------------
-// Load an image or animated GIF file onto a field sphere.
-// GIFs decode via the same gifuct pipeline as the main globe;
-// every frame becomes its own full-wrap texture.
-// (Also the entry point for the sidebar's Upload Image control
-// while a sphere is selected - see main.js's fileUpload bridge.)
+// Load an image or animated GIF file onto a field sphere, into a
+// given face slot (0 = the primary/whole-sphere image, matching
+// main.js's per-face slot numbering - omit it for the primary).
+//
+// GIFs decode via the same gifuct pipeline as the main globe:
+// - As the primary image (faceIndex 0): every frame becomes its own
+//   full-wrap texture and the sphere animates, same as before - GIFs
+//   don't participate in the multi-face system (matching the main
+//   globe's own "per-face slots don't get independent animation"
+//   behavior, see README).
+// - Into a specific face slot (faceIndex > 0): only the first frame
+//   is used, as a static image for that face.
+//
+// (Also the entry point for the sidebar's Upload Image / per-face
+// slot controls while a sphere is selected - see main.js's
+// fileUpload / per-face-slot bridges.)
 // ------------------------------------------------------------
-export async function loadFileOntoFieldSphere(sphere, file) {
+export async function loadFileOntoFieldSphere(sphere, file, faceIndex = 0) {
 
     console.log(
-        `sphere ${sphere.id}: loading ${file.name} (${file.type}, ${(file.size / 1024).toFixed(0)} KB)`
+        `sphere ${sphere.id}: loading ${file.name} (${file.type}, ${(file.size / 1024).toFixed(0)} KB) into face ${faceIndex}`
     );
 
     if (!file.type.startsWith('image/')) {
@@ -588,6 +741,39 @@ export async function loadFileOntoFieldSphere(sphere, file) {
             const pctx =
                 persistent.getContext('2d');
 
+            // A GIF dropped onto a specific face just shows its
+            // first frame there, as a static image - decode/draw one
+            // frame and hand it to the same per-face path a static
+            // image upload uses, instead of the full animation below
+            // (which is reserved for the primary/whole-sphere image).
+            if (faceIndex > 0) {
+
+                const f = frames[0];
+
+                const patch =
+                    document.createElement('canvas');
+
+                patch.width = f.dims.width;
+                patch.height = f.dims.height;
+
+                patch
+                    .getContext('2d')
+                    .putImageData(
+                        new ImageData(
+                            new Uint8ClampedArray(f.patch),
+                            f.dims.width,
+                            f.dims.height
+                        ),
+                        0, 0
+                    );
+
+                pctx.drawImage(patch, f.dims.left, f.dims.top);
+
+                setFaceImage(sphere, faceIndex, persistent);
+
+                return;
+            }
+
             const baked = [];
 
             const maxFrames =
@@ -595,6 +781,20 @@ export async function loadFileOntoFieldSphere(sphere, file) {
 
             const step =
                 frames.length / maxFrames;
+
+            // Repeat the GIF at every face position, same as a
+            // static primary image already does via
+            // regenerateFieldSphereTexture - keeps a sphere's Faces
+            // setting consistent regardless of whether the primary
+            // upload happens to be a GIF or a still image. (Baked
+            // once per frame here, not re-baked every tick - the
+            // animation still just cycles through these pre-baked
+            // canvases, same as before.)
+            const bakeFaceCount =
+                sphere.faceCount || 1;
+
+            const bakeAngularRadius =
+                getAngularRadiusForFaceCount(bakeFaceCount);
 
             for (let i = 0; i < maxFrames; i++) {
 
@@ -628,7 +828,12 @@ export async function loadFileOntoFieldSphere(sphere, file) {
                 snap.getContext('2d').drawImage(persistent, 0, 0);
 
                 baked.push({
-                    canvas: bakeFullWrap(snap),
+                    canvas: generateGlobeTexture(
+                        snap,
+                        bakeAngularRadius,
+                        1024,
+                        bakeFaceCount
+                    ),
                     delay: Math.max(20, f.delay || 100)
                 });
 
@@ -643,6 +848,17 @@ export async function loadFileOntoFieldSphere(sphere, file) {
                 }
             }
 
+            // A new primary image (GIF or static) starts over -
+            // matches main.js's applyCustomImage rule for slot 0.
+            sphere.faceImages = {};
+
+            if (sphere.texture) {
+                sphere.gl.deleteTexture(sphere.texture);
+                sphere.texture = null;
+            }
+
+            disposeFieldSphereFrames(sphere);
+
             sphere.frames = baked.map(b => ({
                 texture: uploadTex(sphere.gl, b.canvas),
                 delay: b.delay
@@ -650,6 +866,8 @@ export async function loadFileOntoFieldSphere(sphere, file) {
 
             sphere.frameIndex = 0;
             sphere.elapsedMs = 0;
+
+            renderFieldSphere(sphere, sphere.phi, sphere.theta);
 
         } else {
 
@@ -666,13 +884,13 @@ export async function loadFileOntoFieldSphere(sphere, file) {
                     i.src = url;
                 });
 
-            sphere.texture =
-                uploadTex(sphere.gl, bakeFullWrap(img));
+            // setFaceImage() already renders (via
+            // regenerateFieldSphereTexture), so there's nothing left
+            // to do here after it but release the object URL.
+            setFaceImage(sphere, faceIndex, img);
 
             URL.revokeObjectURL(url);
         }
-
-        renderFieldSphere(sphere, sphere.phi, sphere.theta);
 
     } catch (err) {
 
@@ -681,27 +899,6 @@ export async function loadFileOntoFieldSphere(sphere, file) {
             err
         );
     }
-}
-
-// Full-wrap bake (same horizontal flip as generateFullWrapTexture)
-function bakeFullWrap(source) {
-
-    const tw = 1024;
-    const th = 512;
-
-    const c =
-        document.createElement('canvas');
-
-    c.width = tw;
-    c.height = th;
-
-    const ctx = c.getContext('2d');
-
-    ctx.translate(tw, 0);
-    ctx.scale(-1, 1);
-    ctx.drawImage(source, 0, 0, tw, th);
-
-    return c;
 }
 
 function uploadTex(gl, source) {
@@ -731,6 +928,8 @@ function renderFieldSphere(sphere, phiVal, thetaVal) {
     gl.uniform1f(sphere.uniforms.phi, phiVal);
     gl.uniform1f(sphere.uniforms.theta, thetaVal);
 
+    gl.activeTexture(gl.TEXTURE0);
+
     if (sphere.frames && sphere.frames.length > 0) {
 
         const frame =
@@ -738,8 +937,18 @@ function renderFieldSphere(sphere, phiVal, thetaVal) {
                 sphere.frameIndex % sphere.frames.length
             ];
 
-        gl.activeTexture(gl.TEXTURE0);
         gl.bindTexture(gl.TEXTURE_2D, frame.texture);
+
+    } else if (sphere.texture) {
+
+        // Explicit on purpose (rather than relying on whatever
+        // texture uploadTex() last left bound): without this, a
+        // static image uploaded onto a sphere that was previously
+        // showing a GIF never actually appeared - sphere.texture got
+        // updated, but the GIF's last frame stayed bound and kept
+        // being drawn every tick since nothing told the GPU to
+        // switch.
+        gl.bindTexture(gl.TEXTURE_2D, sphere.texture);
     }
 
     gl.clearColor(0, 0, 0, 0);
@@ -1113,6 +1322,7 @@ export {
     setSpherePhi,
     setSphereTheta,
     setSphereUseDots,
+    setSphereFaceCount,
     getSphereControls
 };
 
