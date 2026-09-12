@@ -779,26 +779,37 @@ export async function loadFileOntoFieldSphere(sphere, file, faceIndex = 0) {
             const maxFrames =
                 Math.min(frames.length, 40);
 
-            const step =
-                frames.length / maxFrames;
-
             // Repeat the GIF at every face position, same as a
             // static primary image already does via
             // regenerateFieldSphereTexture - keeps a sphere's Faces
             // setting consistent regardless of whether the primary
-            // upload happens to be a GIF or a still image. (Baked
-            // once per frame here, not re-baked every tick - the
-            // animation still just cycles through these pre-baked
-            // canvases, same as before.)
+            // upload happens to be a GIF or a still image.
             const bakeFaceCount =
                 sphere.faceCount || 1;
 
             const bakeAngularRadius =
                 getAngularRadiusForFaceCount(bakeFaceCount);
 
-            for (let i = 0; i < maxFrames; i++) {
+            // First composite EVERY decoded frame in sequence onto the
+            // persistent canvas (the standard GIF approach - patches
+            // only cover the changed region, and disposal tells us when
+            // to restore). Only AFTER every frame is correctly
+            // composited do we subsample down to maxFrames for baking.
+            //
+            // Previously this loop subsampled the INPUT frames first
+            // (drawing only every Nth patch) and composited on top of
+            // that subset. Because these GIFs use disposal 0 (keep
+            // pixels) with partial-canvas patches, skipping intermediate
+            // patches meant their contributions were never drawn, so
+            // ring text from skipped frames' positions ghosted/overlapped
+            // ("text running into itself"), and consecutive baked frames
+            // could end up near-identical - the "GIF sometimes doesn't
+            // move" symptom. Composite-all-then-subsample fixes both.
+            const compositeAll = [];
 
-                const f = frames[Math.floor(i * step)];
+            for (let i = 0; i < frames.length; i++) {
+
+                const f = frames[i];
 
                 const patch =
                     document.createElement('canvas');
@@ -827,15 +838,7 @@ export async function loadFileOntoFieldSphere(sphere, file, faceIndex = 0) {
 
                 snap.getContext('2d').drawImage(persistent, 0, 0);
 
-                baked.push({
-                    canvas: generateGlobeTexture(
-                        snap,
-                        bakeAngularRadius,
-                        1024,
-                        bakeFaceCount
-                    ),
-                    delay: Math.max(20, f.delay || 100)
-                });
+                compositeAll.push(snap);
 
                 if (f.disposalType === 2) {
 
@@ -846,6 +849,25 @@ export async function loadFileOntoFieldSphere(sphere, file, faceIndex = 0) {
                         f.dims.height
                     );
                 }
+            }
+
+            const step =
+                compositeAll.length / maxFrames;
+
+            for (let i = 0; i < maxFrames; i++) {
+
+                const snap =
+                    compositeAll[Math.floor(i * step)];
+
+                baked.push({
+                    canvas: generateGlobeTexture(
+                        snap,
+                        bakeAngularRadius,
+                        1024,
+                        bakeFaceCount
+                    ),
+                    delay: Math.max(20, frames[Math.floor(i * step)].delay || 100)
+                });
             }
 
             // A new primary image (GIF or static) starts over -

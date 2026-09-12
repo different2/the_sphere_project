@@ -215,3 +215,50 @@ Things worth remembering exist on those branches:
 - Dates in the table are true last-modified dates of each snapshot's files;
   commits on the branches carry these dates as their author dates, so
   GitHub's history shows the real timeline.
+
+---
+
+## Bug traced: spawned-sphere GIF corruption + "sometimes doesn't move" (Sep 2, 2026)
+
+**Symptom:** uploading a GIF (e.g. the Laughing Man `assets/laughingman.gif`)
+to a **spawned sphere** (sphere field) showed the ring text ghosting /
+overlapping / "running through itself", sometimes looked like the GIF wasn't
+animating. The **main globe** was fine.
+
+**Root cause:** there are **two separate GIF-compositing implementations**,
+and they differ in one critical way:
+
+- `main.js` `decodeGifFramesProgressive()` — composites **every** decoded
+  frame in sequence onto a persistent canvas, then subsamples the *results*.
+  Correct.
+- `sphere-field.js` `loadFileOntoFieldSphere()` — subsampled the *input*
+  frames first (drew only every Nth patch onto the persistent canvas),
+  skipping intermediate frames entirely.
+
+The Laughing Man asset is 240 frames of **partial-canvas delta patches**
+(extents like `(0,31,670,645)`, not full 676×676) with **disposal 0** (keep
+pixels). Because disposal keeps pixels and patches are partial, skipping
+intermediate patches meant their ring-text contributions were never drawn —
+old positions persisted (ghosting) and consecutive baked frames could come
+out near-identical ("GIF doesn't move sometimes").
+
+**Fix:** rewrote the `sphere-field.js` loop to composite every frame first,
+collect all snapshots, *then* subsample to `maxFrames` (40) for baking —
+matching the main globe. Verified working.
+
+**Lesson — the duplication to watch for:** this bug existed because the same
+GIF-compositing logic lives in two modules (`main.js` and `sphere-field.js`)
+as near-duplicates with a subtle behavioral difference. Before touching
+either, diff the two implementations or factor the composite-into-frames
+logic into one shared helper (e.g. in `face-texture.js`, which both already
+import) so this can't drift again.
+
+### Note on Graphify (added same day)
+
+Used Graphify (code knowledge graph) to trace this. Verdict: **great as a
+navigation/indexing layer** ("where does this live, what calls what,
+architecture overview") but **not a substitute for reading the implementation
+for a behavioral bug** — it led the trace toward the main globe first because
+that's where the visible call chain pointed, and cannot surface semantic
+duplication like the two-compositor split above. Query it for all related
+functions *across modules* early to catch parallel-implementation traps.
