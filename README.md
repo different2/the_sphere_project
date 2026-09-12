@@ -99,6 +99,32 @@ texture or as a Fibonacci-lattice dot pattern.
   was already showing a GIF never actually appeared, since the GIF's
   last frame stayed bound for rendering even after `sphere.texture` was
   updated underneath it.
+- **Rewritten (Sept 2026): single-canvas sphere field.** Spawned
+  spheres used to each own a `<canvas>` + WebGL context, which capped
+  the field at 9 (browsers allow only ~16 live contexts per page).
+  `sphere-field.js` now draws the WHOLE field on one canvas with one
+  context: each sphere renders into its own viewport/scissor box (the
+  multi-viewport trick), so the browser cap is gone - thousands of
+  spheres are limited only by your GPU and texture memory (empty
+  spheres are nearly free; each uploaded image costs one 1024x512
+  texture, each GIF up to 40; sharing one texture object across many
+  spheres costs nothing extra). One supporting fix: the field enables
+  alpha blending, so overlapping spheres' transparent box corners
+  composite instead of punching rectangular bite-marks into
+  already-drawn neighbors. The main globe keeps its own canvas,
+  untouched. Supporting change: `fragmentShader.js` gained a
+  `uFragOffset` uniform (defaults to 0,0, so the main globe is
+  unaffected) because `gl_FragCoord` is measured from the bottom-left
+  of the whole canvas, not each sphere's box - without it every sphere
+  draws its "corner" of the screen UV and renders as black. Interaction
+  (click-select, drag-spin, shift+drag-move, dblclick spawn/picker,
+  drop-to-upload) is now hit-tested against sphere rectangles by code
+  instead of the DOM. This also fixed a latent bug: `shiftDown` was
+  declared but never updated in the old file, so Shift+drag never
+  actually moved spheres; keyboard shift state is now tracked. Verified
+  with real spawned spheres + pokeball/GIF uploads + face-slot
+  composites in headless Chrome; stress-tested 10,000 spheres (smooth
+  on real GPU; software-rendered headless is much slower).
 - Fixed a latent GLSL naming collision in `fragmentShader.js` (a local
   variable was named `sample`, which some GLSL compilers treat as a
   reserved word) - purely a rename, no behavior change.
@@ -114,6 +140,15 @@ texture or as a Fibonacci-lattice dot pattern.
 ## Project structure
 
 - `index.html`, `styles.css` - page and UI.
+- `server.py` - dev server (replaces `python3 -m http.server`): same
+  static serving PLUS a `/_assets-list` endpoint, which powers the
+  Texture dropdown's auto-populated "Assets folder" group - drop any
+  image/gif into `assets/` and it appears in the menu within ~4s
+  (removed files vanish too). `laughingman.gif` and
+  `8k_earth_daymap.jpg` stay hidden there since the built-in
+  Laughing Man / Earth Map presets already load them. Without
+  `server.py` (plain http.server or static hosting) the dropdown
+  just keeps its hand-written options.
 - `main.js` - WebGL setup, texture generation, controls, GIF export.
 - `fragmentShader.js` - the sphere/dots/lighting shader.
 - `phenomenon.js` - small WebGL rendering helper library.

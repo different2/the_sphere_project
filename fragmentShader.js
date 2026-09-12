@@ -3,6 +3,15 @@ const fragmentShader = /*glsl*/`
 
     uniform vec2 uResolution;
 
+    /*
+     * Window-space origin of the region uResolution describes. Always
+     * (0,0) for full-canvas draws (the main globe), so this changes
+     * nothing there; the shared sphere-field canvas sets it per
+     * sphere, because gl_FragCoord is measured from the bottom-left
+     * of the whole canvas, not from each viewport box.
+     */
+    uniform vec2 uFragOffset;
+
     uniform float phi;
     uniform float theta;
 
@@ -645,7 +654,7 @@ const fragmentShader = /*glsl*/`
     void main() {
 
         vec2 uv =
-            gl_FragCoord.xy /
+            (gl_FragCoord.xy - uFragOffset) /
             uResolution.xy;
 
 

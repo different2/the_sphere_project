@@ -285,15 +285,15 @@ html, body {
             display: block;
         }
 
-        .field-sphere {
+        /* One shared GL surface for the whole field (see the
+           sphere-field.js header). Individual spheres are drawn as
+           viewport boxes on this canvas - no per-sphere elements. */
+        #fieldCanvas {
             position: absolute;
-            /* NO border-radius here - the fragment shader draws the
-               full orb (globe disc + outer glow) against transparency.
-               A CSS circle clip would cut the glow off at the canvas
-               edge, producing a broken crescent instead of one
-               complete sphere. */
-            cursor: pointer;
-            transition: box-shadow 0.2s ease-out;
+            inset: 0;
+            width: 100%;
+            height: 100%;
+            display: block;
 
             /* Keep pointer events flowing for sphere dragging - the
                browser otherwise cancels them to scroll/zoom on
@@ -302,40 +302,30 @@ html, body {
             touch-action: none;
         }
 
-        .field-sphere:hover {
-            filter: drop-shadow(0 0 12px rgba(120, 200, 255, 0.6));
-        }
-
-        /* Selected sphere - a small FIXED-SIZE badge ring so it's
-           obvious which sphere is selected.
-
-           The canvas is intentionally a square (it's the GL drawing
-           surface; the shader draws a round disc inside it against
-           transparency - nothing is visually square). The marker
-           does NOT scale with the sphere: it surrounds the disc
+        /* Selected sphere - a small FIXED-SIZE badge ring floating
+           over the canvas at the sphere's center (was a CSS
+           ::before on each per-sphere canvas; there's one canvas
+           now, so one movable element). It surrounds the disc
            (blue) while the disc is small, and once the sphere
            outgrows the 36px badge, the badge stays 36px, sits ON
-           the sphere's face, and turns RED. Deselecting hides it. */
-        .field-sphere.selected::before {
-            content: '';
-            position: absolute;
-            left: 50%;
-            top: 50%;
-            width: var(--sel-size, 24px);
-            height: var(--sel-size, 24px);
+           the sphere's face, and turns RED. Deselecting hides it.
+           The label text rides in its own child span. */
+        .field-marker {
+            position: fixed;
             transform: translate(-50%, -50%);
             border: 2px solid rgba(120, 200, 255, 0.9);
             border-radius: 50%;
             pointer-events: none;
+            z-index: 2;
         }
 
         /* Sphere bigger than the badge: red ring on its face. */
-        .field-sphere.selected.marker-overflow::before {
+        .field-marker.marker-overflow {
             border-color: rgba(255, 80, 80, 0.95);
             background: rgba(255, 80, 80, 0.12);
         }
 
-        .field-sphere.selected::after {
+        .field-marker::after {
             content: attr(data-label);
             position: absolute;
             top: -18px;
@@ -345,13 +335,7 @@ html, body {
             color: rgba(255, 255, 255, 0.95);
             text-shadow: 0 0 3px #000, 0 0 4px #000;
             pointer-events: none;
-        }
-
-        /* While Move mode (or shift) is held, dragging moves the
-           sphere instead of spinning it. */
-        .field-sphere.move-mode,
-        .field-sphere.force-move {
-            cursor: move;
+            white-space: nowrap;
         }
 
         .move-hint {

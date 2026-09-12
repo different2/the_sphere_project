@@ -1,29 +1,42 @@
 // ============================================================
 // Sphere Field - "many spheres" mode
 //
-// A separate full-screen surface (independent of the single main
-// globe) where the user can spawn any number of spheres and drop an
-// image or GIF onto each one. Every sphere is its own tiny WebGL
-// context rendering the same fragment-shader pipeline as the main
-// globe (crisp texture mode), animated on a shared rAF loop.
+// A full-screen surface (independent of the single main globe)
+// where the user can spawn spheres and drop an image or GIF onto
+// each one.
 //
-// Browsers cap active WebGL contexts (~8-16). Spawning beyond the
-// cap shows a warning instead of silently breaking; recycling old
-// contexts is deliberately NOT automatic, since each sphere's
-// uploaded content would be lost.
+// ARCHITECTURE (rewritten Sept 2026): previously EVERY sphere was
+// its own <canvas> with its own WebGL context, which hard-capped
+// the field at ~9 spheres - browsers allow only ~16 live contexts
+// per page. Now the whole field is ONE canvas with ONE WebGL
+// context: every sphere is drawn into its own viewport/scissor box
+// on that shared surface (the classic multi-viewport trick), using
+// the exact same fragment shader as before. Sphere content -
+// rotation, spin settings, GIF frames, per-face composites - lives
+// in plain JS objects; GL resources (textures) all belong to the
+// single shared context.
+//
+// Practical limits are now your GPU/CPU, not the browser:
+// empty spheres are nearly free (one shared 1x1 dummy texture);
+// each sphere carrying an uploaded image costs one baked texture,
+// and an animated GIF up to 40 frames of them (1024x512 each), so
+// thousands of textured spheres can exhaust VRAM even though the
+// renderer itself happily handles tens of thousands.
 //
 // Clicking a sphere SELECTS it: the sidebar's spin/glow/scale/etc.
 // controls then drive that sphere (see the control bridge at the
 // bottom). Delete / Backspace removes it; Escape deselects.
 // Shift+drag (or Move mode, toggled with M) repositions a sphere.
+// Later-spawned spheres draw on top of earlier ones.
 //
 // Each sphere also has its own Faces layout (1/2/3/4/6, same as the
 // main globe) and per-face image slots - see faceImages/faceCount
-// below and regenerateFieldSphereTexture(). Uploading a second image
-// (e.g. into a per-face slot via the sidebar while this sphere is
-// selected) bakes a real composite through the shared
-// generateGlobeTexture(), instead of the earlier behavior where every
-// upload just overwrote the whole sphere with a new full wrap.
+// below and regenerateFieldSphereTexture(). Uploading a second
+// image (e.g. into a per-face slot via the sidebar while this
+// sphere is selected) bakes a real composite through the shared
+// generateGlobeTexture(), instead of the earlier behavior where
+// every upload just overwrote the whole sphere with a new full
+// wrap.
 // ============================================================
 
 import {
@@ -44,7 +57,9 @@ const field =
 let fieldSpheres = [];
 let fieldNextId = 1;
 
-const MAX_FIELD_SPHERES = 9;
+// No functional limit anymore - this is only a guard against
+// accidentally spawning a million entries and locking up the tab.
+const HARD_LIMIT = 50000;
 
 // The sphere the sidebar is currently driving (or null).
 let selectedSphere = null;
@@ -65,55 +80,96 @@ const FIELD_VERTEX = /*glsl*/`
 // Same fragment shader source as the main globe.
 const FIELD_FRAGMENT = fragmentShader;
 
-// Per-sphere control state, mirroring the main globe's sidebar
-// variables (phi/theta/dots/scale/spin/glow/opacity/alpha). Every
-// sphere starts from the same defaults; the sidebar writes into
-// whichever sphere is selected.
-function defaultSphereControls() {
+// Shader geometry: with the `scale` uniform pinned at 1, the disc
+// radius is 0.64 of the viewport's half-range, i.e. the disc is
+// always exactly 64% of the box it's drawn in (see the old
+// resizeSphereCanvas comment - kept because the sizing math below
+// reproduces it 1:1).
+const DISC_FRACTION = 0.64;
 
-    return {
-        spinRate: 0.01 + Math.random() * 0.01,
-        paused: false,
-        spinType: 'randomized',
-        spinSpeedMultiplier: 1.0,
-        dots: 25000,
-        scale: 1.0,
-        glowColor: [0.3, 0.8, 1.0],
-        opacity: 1,
-        ignoreAlpha: 0
-    };
+// A sphere's GL box never exceeds this many device pixels; past it
+// the sphere just renders softer (same 1200px cap the old
+// per-canvas version used).
+const MAX_BOX_PX = 1200;
+
+// ------------------------------------------------------------
+// One shared canvas + GL context for the entire field.
+// ------------------------------------------------------------
+let fieldCanvas = null;
+let gl = null;
+let program = null;
+let uniforms = null;
+let quadBuffer = null;
+let dummyTexture = null;
+
+let canvasW = 0;
+let canvasH = 0;
+let dpr = 1;
+
+// Selection marker - a small DOM ring/label floating over the
+// canvas at the selected sphere's position (it was a CSS ::before
+// on each sphere canvas before; with one canvas we need one
+// movable element instead).
+const marker =
+    document.createElement('div');
+
+marker.className = 'field-marker';
+marker.style.display = 'none';
+
+function sphereDpr() {
+    return Math.min(
+        Math.max(window.devicePixelRatio || 1, 1),
+        2
+    );
 }
 
-// ------------------------------------------------------------
-// One spawned sphere: own canvas, GL context, program, texture,
-// rotation state, optional GIF frame stream.
-// ------------------------------------------------------------
-function createFieldSphere(x, y, size) {
+function sizeFieldCanvas() {
 
-    const el =
+    dpr = sphereDpr();
+
+    const w = Math.round(window.innerWidth * dpr);
+    const h = Math.round(window.innerHeight * dpr);
+
+    if (fieldCanvas.width !== w || fieldCanvas.height !== h) {
+
+        fieldCanvas.width = w;
+        fieldCanvas.height = h;
+    }
+
+    canvasW = w;
+    canvasH = h;
+}
+
+function ensureFieldCanvas() {
+
+    if (gl) {
+
+        sizeFieldCanvas();
+        return;
+    }
+
+    fieldCanvas =
         document.createElement('canvas');
 
-    el.className = 'field-sphere';
-    el.width = size * 2;
-    el.height = size * 2;
-    el.style.width = `${size}px`;
-    el.style.height = `${size}px`;
-    el.style.left = `${x - size / 2}px`;
-    el.style.top = `${y - size / 2}px`;
+    fieldCanvas.id = 'fieldCanvas';
 
-    const gl =
-        el.getContext('webgl', {
+    // preserveDrawingBuffer: true, like the old per-sphere contexts -
+    // it lets the buffer be re-read (pixel readback, future field
+    // exports) at a small perf cost, and antialias stays off since
+    // the orb edge comes from the fragment math, not geometry AA.
+    gl =
+        fieldCanvas.getContext('webgl', {
             alpha: true,
-            antialias: true,
+            antialias: false,
             depth: false,
             preserveDrawingBuffer: true
         });
 
     if (!gl) {
 
-        el.remove();
-
-        return null;
+        throw new Error(
+            'Sphere field: could not create the shared WebGL context.'
+        );
     }
 
     function compile(type, src) {
@@ -133,7 +189,7 @@ function createFieldSphere(x, y, size) {
         return s;
     }
 
-    const program = gl.createProgram();
+    program = gl.createProgram();
 
     gl.attachShader(program, compile(gl.VERTEX_SHADER, FIELD_VERTEX));
     gl.attachShader(program, compile(gl.FRAGMENT_SHADER, FIELD_FRAGMENT));
@@ -148,7 +204,8 @@ function createFieldSphere(x, y, size) {
 
     gl.useProgram(program);
 
-    // Fullscreen quad
+    // Fullscreen quad - drawn once per sphere; each sphere's
+    // viewport/scissor box clips it to that sphere's square.
     const quad = new Float32Array([
         -1, -1, 0,
          1, -1, 0,
@@ -158,9 +215,9 @@ function createFieldSphere(x, y, size) {
         -1,  1, 0
     ]);
 
-    const buf = gl.createBuffer();
+    quadBuffer = gl.createBuffer();
 
-    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
     gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
 
     const aPosition =
@@ -172,8 +229,9 @@ function createFieldSphere(x, y, size) {
     const U = name =>
         gl.getUniformLocation(program, name);
 
-    const uniforms = {
+    uniforms = {
         uResolution: U('uResolution'),
+        uFragOffset: U('uFragOffset'),
         phi: U('phi'),
         theta: U('theta'),
         dots: U('dots'),
@@ -187,41 +245,100 @@ function createFieldSphere(x, y, size) {
         uIgnoreAlpha: U('uIgnoreAlpha'),
         uUseDots: U('uUseDots'),
         uUseFaces: U('uUseFaces'),
-        uFaceCountF: U('uFaceCountF'),
         uTexture: U('uTexture')
     };
 
-    gl.uniform2f(uniforms.uResolution, el.width, el.height);
-
-    // Without this the viewport stays [0,0,0,0] - nothing ever
-    // rasterizes, and the canvas shows only whatever bleeds through
-    // from behind (the main globe), which looks like a displaced
-    // half-sphere overlapping a real one.
-    gl.viewport(0, 0, el.width, el.height);
-    gl.uniform1f(uniforms.dots, 25000);
-    gl.uniform1f(uniforms.scale, 1.0);
-    gl.uniform3f(uniforms.baseColor, 0.3, 0.6, 1.0);
-    gl.uniform3f(uniforms.glowColor, 0.3, 0.8, 1.0);
+    // Values that never vary per-sphere - set once for the shared
+    // context's lifetime (the old per-canvas code set these at
+    // context creation).
     gl.uniform1f(uniforms.dotsBrightness, 6);
     gl.uniform1f(uniforms.diffuse, 1.2);
     gl.uniform1f(uniforms.dark, 1);
-    gl.uniform1f(uniforms.opacity, 1);
-    gl.uniform1f(uniforms.uIgnoreAlpha, 0);
-    gl.uniform1f(uniforms.uUseDots, 0);
+    gl.uniform3f(uniforms.baseColor, 0.3, 0.6, 1.0);
     gl.uniform1f(uniforms.uUseFaces, 0);
     gl.uniform1i(uniforms.uTexture, 0);
 
-    const sphere = {
+    // A sphere with nothing uploaded samples this fully-transparent
+    // 1x1 texture. The old per-context code just left a never-bound
+    // unit 0 (black); on the shared context a previously-drawn
+    // sphere's texture would still be bound, so an empty sphere
+    // would smear another sphere's image over itself.
+    dummyTexture = gl.createTexture();
+
+    gl.bindTexture(gl.TEXTURE_2D, dummyTexture);
+    gl.texImage2D(
+        gl.TEXTURE_2D, 0, gl.RGBA,
+        1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE,
+        new Uint8Array([0, 0, 0, 0])
+    );
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+    gl.enable(gl.SCISSOR_TEST);
+    gl.clearColor(0, 0, 0, 0);
+
+    // Alpha blending: with 10k spawns, sphere boxes overlap heavily.
+    // Each box's corners are transparent; without blending they'd
+    // write straight over already-drawn neighbors as rectangular
+    // bite-marks (gl_FragColor alpha 0 = overwrite, not skip). With
+    // SRC_ALPHA blending, transparent fragments keep what's beneath
+    // and overlapping glows composite in spawn order (later = on
+    // top), matching the old per-canvas DOM stacking.
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+    sizeFieldCanvas();
+
+    field.insertBefore(fieldCanvas, field.firstChild);
+    field.appendChild(marker);
+}
+
+window.addEventListener('resize', () => {
+
+    if (!gl) return;
+
+    sizeFieldCanvas();
+    renderField();
+});
+
+// Per-sphere control state, mirroring the main globe's sidebar
+// variables (phi/theta/dots/scale/spin/glow/opacity/alpha). Every
+// sphere starts from the same defaults; the sidebar writes into
+// whichever sphere is selected.
+function defaultSphereControls() {
+
+    return {
+        spinRate: 0.01 + Math.random() * 0.01,
+        paused: false,
+        spinType: 'randomized',
+        spinSpeedMultiplier: 1.0,
+        dots: 25000,
+        scale: 1.0,
+        glowColor: [0.3, 0.8, 1.0],
+        opacity: 1,
+        ignoreAlpha: 0,
+        useDots: 0
+    };
+}
+
+// ------------------------------------------------------------
+// One spawned sphere: plain JS state (position, rotation,
+// controls, textures, optional GIF frame stream). No DOM element,
+// no dedicated context - the shared renderer draws it into its own
+// box each frame.
+// ------------------------------------------------------------
+function createFieldSphere(x, y, size) {
+
+    return {
         id: fieldNextId++,
-        el,
-        gl,
-        program,
-        uniforms,
-        // Base canvas size in px - the canvas itself never changes;
-        // visual sphere size comes from the scale uniform, so the
-        // disc can grow well beyond the canvas without reallocating
-        // the GL surface.
+        // Base disc size in CSS px (scale 1) - the drawn box is
+        // baseSize * scale / DISC_FRACTION, exactly like the old
+        // per-canvas sizing.
         baseSize: size,
+        centerX: x,
+        centerY: y,
         phi: Math.random() * Math.PI * 2,
         theta: Math.random() * Math.PI * 2,
         texture: null,
@@ -238,206 +355,251 @@ function createFieldSphere(x, y, size) {
         faceImages: {},
         faceCount: 1
     };
-
-    // --------------------------------------------------------
-    // Pointer interaction: click = select, drag = spin (or move
-    // with Shift / Move mode). A click with barely any movement
-    // selects; a drag never changes the selection.
-    // --------------------------------------------------------
-    let downXY = null;
-    let dragging = false;
-    let moving = false;
-    let lx = 0;
-    let ly = 0;
-    let shiftDown = false;
-
-    const wantsMove = () =>
-        moveMode || shiftDown;
-
-    el.addEventListener('pointerdown', (e) => {
-
-        downXY = [e.clientX, e.clientY];
-        dragging = true;
-        moving = wantsMove();
-        lx = e.clientX;
-        ly = e.clientY;
-
-        // The pointerId can be invalidated between the event and
-        // this call (e.g. a touch-scroll cancelled it) - capture is
-        // an optimization, so a failure here shouldn't kill the
-        // interaction.
-        try {
-            el.setPointerCapture(e.pointerId);
-        } catch (err) {
-            console.warn(
-                `sphere ${sphere.id}: pointer capture failed (interaction still works):`,
-                err.message
-            );
-        }
-
-        console.log(
-            `sphere ${sphere.id}: pointer down (${moving ? 'MOVE' : 'SPIN'} mode)`
-        );
-    });
-
-    el.addEventListener('pointermove', (e) => {
-
-        if (!dragging) {
-
-            // Hover feedback only - cursor shows what a press
-            // would do.
-            el.classList.toggle('force-move', wantsMove());
-            return;
-        }
-
-        const dx = e.clientX - lx;
-        const dy = e.clientY - ly;
-        lx = e.clientX;
-        ly = e.clientY;
-
-        if (moving) {
-
-            moveSphereTo(
-                sphere,
-                sphere.centerX + dx,
-                sphere.centerY + dy
-            );
-
-            return;
-        }
-
-        sphere.phi += dx * 0.01;
-        sphere.theta += dy * 0.01;
-    });
-
-    el.addEventListener('pointerup', (e) => {
-
-        dragging = false;
-
-        const wasAClick =
-            downXY &&
-            Math.hypot(
-                e.clientX - downXY[0],
-                e.clientY - downXY[1]
-            ) < 4;
-
-        downXY = null;
-
-        if (wasAClick) {
-
-            // Plain click selects (so the sidebar drives this
-            // sphere). Double-click is what opens the file picker -
-            // see the dblclick listener below.
-            selectSphere(sphere);
-        }
-    });
-
-    // Double-click a sphere to choose an image/GIF for it (single
-    // drag/drop also works).
-    el.addEventListener('dblclick', (e) => {
-
-        e.stopPropagation();
-
-        selectSphere(sphere);
-        openFilePickerForSphere(sphere);
-    });
-
-    // Drop image/GIF onto it
-    el.addEventListener('dragover', (e) => e.preventDefault());
-
-    el.addEventListener('drop', async (e) => {
-
-        e.preventDefault();
-
-        const file = e.dataTransfer.files[0];
-
-        if (file) {
-            await loadFileOntoFieldSphere(sphere, file);
-        }
-    });
-
-    field.appendChild(el);
-
-    // Track center coordinates for move-drag (style.left/top hold
-    // the top-left corner).
-    sphere.centerX = x;
-    sphere.centerY = y;
-
-    return sphere;
 }
 
-// Reposition a sphere so its CENTER lands at (x, y).
+// The sphere's square: CSS box (hit-testing, marker placement) and
+// device-pixel box (viewport/scissor, capped for GPU sanity).
+function sphereBox(s) {
+
+    const scale = Math.max(0.05, s.controls.scale || 1);
+
+    const cssPx = Math.ceil((s.baseSize * scale) / DISC_FRACTION);
+
+    return {
+        cssPx,
+        devPx: Math.min(
+            Math.max(1, Math.round(cssPx * dpr)),
+            MAX_BOX_PX
+        )
+    };
+}
+
+// Reposition a sphere so its CENTER lands at (x, y) - CSS px.
 function moveSphereTo(sphere, x, y) {
 
-    const w = sphere.el.offsetWidth;
-    const h = sphere.el.offsetHeight;
-
     sphere.centerX = x;
     sphere.centerY = y;
 
-    sphere.el.style.left = `${x - w / 2}px`;
-    sphere.el.style.top = `${y - h / 2}px`;
+    updateSelectionMarker();
 }
 
-// Resize a sphere's canvas when its scale changes.
+// ------------------------------------------------------------
+// Rendering - the whole field in one pass over one context.
 //
-// Shader geometry: the disc's diameter is always 0.64 * (scale
-// uniform) * canvasWidth. That means ANY scale-uniform value other
-// than 1 eventually overflows the canvas and clips the sphere into
-// a square. So for field spheres we keep the uniform at 1 and do
-// ALL sizing through the canvas itself: the disc is then always
-// exactly 64% of the canvas, and growing/shrinking the canvas CSS
-// size grows/shrinks the sphere linearly - never clipped, never
-// square, at any scale.
-function resizeSphereCanvas(sphere) {
+// Multi-viewport trick: per sphere, point gl.viewport + gl.scissor
+// at its square region of the shared canvas. The fullscreen quad
+// then fills EXACTLY that box (viewport = the [-1,1] -> box
+// mapping, scissor clips anything beyond), so the unchanged
+// fragment shader's gl_FragCoord/uResolution math sees a square
+// [0,1] window and renders the sphere pixel-for-pixel as it used
+// to on its own canvas.
+// ------------------------------------------------------------
+function renderField() {
 
-    const scale = Math.max(0.05, sphere.controls.scale || 1);
-
-    // Visual disc = baseSize * scale; disc = 0.64 * canvas, so:
-    const cssSize = Math.ceil(sphere.baseSize * scale / 0.64);
-
-    // GL buffer follows the CSS size (capped for GPU sanity - past
-    // the cap CSS stretch keeps the exact visual size, just softer).
-    const maxBuffer = 1200;
-    const bufferPx = Math.min(cssSize, maxBuffer);
-
-    // Keep the scale uniform pinned at 1 - see the comment above.
-    sphere.gl.useProgram(sphere.program);
-    sphere.gl.uniform1f(sphere.uniforms.scale, 1);
-
-    if (
-        sphere.el.width !== bufferPx ||
-        sphere.el.height !== bufferPx ||
-        parseFloat(sphere.el.style.width) !== cssSize
-    ) {
-
-        const oldW = sphere.el.width;
-
-        sphere.el.width = bufferPx;
-        sphere.el.height = bufferPx;
-        sphere.el.style.width = `${cssSize}px`;
-        sphere.el.style.height = `${cssSize}px`;
-
-        moveSphereTo(sphere, sphere.centerX, sphere.centerY);
-
-        // Resizing a canvas clears it and resets GL state.
-        sphere.gl.viewport(0, 0, sphere.el.width, sphere.el.height);
-        sphere.gl.uniform2f(
-            sphere.uniforms.uResolution,
-            sphere.el.width,
-            sphere.el.height
-        );
-
-        console.log(
-            `sphere ${sphere.id}: canvas resized ${oldW} -> ${bufferPx} (css ${cssSize}px, scale ${scale})`
-        );
+    if (!gl) {
+        return;
     }
 
-    // Selection marker hugs the disc (64% of the canvas) + margin.
-    sphere.el.style.setProperty('--sel-radius', '70%');
+    // The scissor test may still be on from a previous frame's last
+    // sphere; a clear that respects it would only wipe that one box
+    // and leave stale sphere pixels alive forever (a shrunk, moved
+    // or deleted sphere's old box would keep its last render).
+    gl.disable(gl.SCISSOR_TEST);
+    gl.viewport(0, 0, canvasW, canvasH);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.enable(gl.SCISSOR_TEST);
 
-    renderFieldSphere(sphere, sphere.phi, sphere.theta);
-    updateSelectionMarker(sphere);
+    for (const s of fieldSpheres) {
+
+        const { devPx } =
+            sphereBox(s);
+
+        const x0 =
+            Math.round(s.centerX * dpr - devPx / 2);
+
+        // CSS y grows downward, GL viewport y grows upward.
+        const y0gl =
+            canvasH - Math.round(s.centerY * dpr + devPx / 2);
+
+        gl.viewport(x0, y0gl, devPx, devPx);
+        gl.scissor(x0, y0gl, devPx, devPx);
+
+        const c = s.controls;
+
+        // The shader's uv math must see THIS box as its [0,1]
+        // window: gl_FragCoord is canvas-global, so pass the box's
+        // bottom-left corner as the offset.
+        gl.uniform2f(uniforms.uFragOffset, x0, y0gl);
+        gl.uniform2f(uniforms.uResolution, devPx, devPx);
+        gl.uniform1f(uniforms.phi, s.phi);
+        gl.uniform1f(uniforms.theta, s.theta);
+        gl.uniform1f(uniforms.dots, c.dots || 25000);
+        gl.uniform1f(uniforms.scale, 1);
+        gl.uniform1f(uniforms.opacity, c.opacity ?? 1);
+        gl.uniform1f(uniforms.uIgnoreAlpha, c.ignoreAlpha || 0);
+        gl.uniform1f(uniforms.uUseDots, c.useDots || 0);
+
+        const glow = c.glowColor || [0.3, 0.8, 1.0];
+
+        gl.uniform3f(
+            uniforms.glowColor,
+            glow[0], glow[1], glow[2]
+        );
+
+        gl.activeTexture(gl.TEXTURE0);
+
+        if (s.frames && s.frames.length > 0) {
+
+            gl.bindTexture(
+                gl.TEXTURE_2D,
+                s.frames[s.frameIndex % s.frames.length].texture
+            );
+
+        } else if (s.texture) {
+
+            // Explicit bind (not relying on whatever uploadTex()
+            // left bound): a static image uploaded onto a sphere
+            // that was previously showing a GIF must switch to the
+            // new texture.
+            gl.bindTexture(gl.TEXTURE_2D, s.texture);
+
+        } else {
+
+            gl.bindTexture(gl.TEXTURE_2D, dummyTexture);
+        }
+
+        gl.drawArrays(gl.TRIANGLES, 0, 6);
+    }
+}
+
+// Single-sphere render entry kept for call-site clarity (spawn,
+// uploads, control changes) - one pass redraws everything anyway.
+function renderFieldSphere() {
+
+    if (field.classList.contains('active')) {
+        renderField();
+    }
+}
+
+// ------------------------------------------------------------
+// Field animation loop - advances every sphere's rotation and GIF
+// playback on one shared rAF, then redraws the field once.
+// Rotation behavior (spin type, speed, pause) comes from each
+// sphere's own controls object, which the sidebar writes into for
+// the selected sphere.
+// ------------------------------------------------------------
+let fieldRunning = false;
+
+function fieldTick(ts) {
+
+    if (!field.classList.contains('active')) {
+
+        fieldRunning = false;
+        return;
+    }
+
+    for (const s of fieldSpheres) {
+
+        if (s.lastTs !== null) {
+
+            const dt = ts - s.lastTs;
+            const c = s.controls;
+
+            if (!c.paused) {
+
+                if (c.spinType === 'axis') {
+
+                    s.phi +=
+                        PHI_RATE *
+                        c.spinSpeedMultiplier *
+                        dt / 16.7;
+
+                } else {
+
+                    s.phi +=
+                        PHI_RATE *
+                        c.spinSpeedMultiplier *
+                        dt / 16.7;
+
+                    s.theta +=
+                        THETA_RATE *
+                        c.spinSpeedMultiplier *
+                        dt / 16.7;
+                }
+            }
+
+            if (s.frames && s.frames.length > 0) {
+
+                s.elapsedMs += dt;
+
+                let guard = 0;
+
+                while (
+                    s.elapsedMs >=
+                        s.frames[s.frameIndex].delay &&
+                    guard < s.frames.length
+                ) {
+
+                    s.elapsedMs -=
+                        s.frames[s.frameIndex].delay;
+
+                    s.frameIndex =
+                        (s.frameIndex + 1) %
+                        s.frames.length;
+
+                    guard++;
+                }
+            }
+        }
+
+        s.lastTs = ts;
+    }
+
+    renderField();
+
+    requestAnimationFrame(fieldTick);
+}
+
+function startFieldLoop() {
+
+    if (fieldRunning) return;
+
+    fieldRunning = true;
+    requestAnimationFrame(fieldTick);
+}
+
+// ------------------------------------------------------------
+// Rotation rates matching the main globe's animate() loop, so the
+// Spin speed slider means the same thing in both modes.
+// ------------------------------------------------------------
+const PHI_RATE = 0.002;
+const THETA_RATE = 0.0007;
+
+// ------------------------------------------------------------
+// Hit-testing: which sphere owns this client-space point?
+// The old code got this free (one DOM element per sphere); now the
+// canvas is one element, so spheres are plain rects - tested
+// topmost-first (last spawned = drawn last = on top).
+// ------------------------------------------------------------
+function sphereAtPoint(clientX, clientY) {
+
+    for (let i = fieldSpheres.length - 1; i >= 0; i--) {
+
+        const s =
+            fieldSpheres[i];
+
+        const half =
+            sphereBox(s).cssPx / 2;
+
+        if (
+            Math.abs(clientX - s.centerX) <= half &&
+            Math.abs(clientY - s.centerY) <= half
+        ) {
+            return s;
+        }
+    }
+
+    return null;
 }
 
 // ------------------------------------------------------------
@@ -450,23 +612,19 @@ function selectSphere(sphere) {
         return;
     }
 
-    if (selectedSphere) {
-        selectedSphere.el.classList.remove('selected');
-    }
-
     selectedSphere = sphere;
 
     if (sphere) {
 
-        sphere.el.classList.add('selected');
-        sphere.el.dataset.label = `Sphere ${sphere.id}`;
-
+        marker.dataset.label = `Sphere ${sphere.id}`;
         console.log(`sphere ${sphere.id}: SELECTED (sidebar now drives this sphere)`);
+
     } else {
 
         console.log('selection cleared');
     }
 
+    updateSelectionMarker();
     notifySelectionChanged();
 }
 
@@ -491,6 +649,39 @@ function notifySelectionChanged() {
     }
 }
 
+// Sizes/positions the selection marker over the selected sphere.
+// Same visual rules as the old CSS ::before badge: it surrounds the
+// disc (blue) while the disc is small, and once the disc exceeds
+// 36px the marker stays 36px, sits ON the sphere, and turns red.
+function updateSelectionMarker() {
+
+    if (!selectedSphere || !fieldCanvas) {
+
+        marker.style.display = 'none';
+        return;
+    }
+
+    const s =
+        selectedSphere;
+
+    const scale = Math.max(0.05, s.controls.scale || 1);
+
+    // Disc radius as fraction of the box (the box clips anything
+    // bigger - same clamp the old marker used).
+    const discFraction = Math.min(1, 1 / scale);
+
+    const discPx = discFraction * s.baseSize;
+    const markerDiameter = Math.min(discPx, 36);
+    const overflow = discPx > 36;
+
+    marker.style.display = 'block';
+    marker.style.width = `${markerDiameter}px`;
+    marker.style.height = `${markerDiameter}px`;
+    marker.style.left = `${s.centerX}px`;
+    marker.style.top = `${s.centerY}px`;
+    marker.classList.toggle('marker-overflow', overflow);
+}
+
 function openFilePickerForSphere(sphere) {
 
     const input =
@@ -510,6 +701,191 @@ function openFilePickerForSphere(sphere) {
 }
 
 // ------------------------------------------------------------
+// Pointer interaction on the shared canvas: click = select, drag =
+// spin (or move with Shift / Move mode), double-click on a sphere =
+// file picker, on empty space = spawn. A click with barely any
+// movement selects; a drag never changes the selection.
+// ------------------------------------------------------------
+let downXY = null;
+let dragging = false;
+let dragSphere = null;
+let moving = false;
+let lx = 0;
+let ly = 0;
+let shiftDown = false;
+
+// The old per-canvas code declared shiftDown but never updated it,
+// so Shift+drag silently never moved spheres. Keep it live from
+// both keyboard state and the shift key held during pointer events.
+window.addEventListener('keydown', (e) => {
+    if (e.key === 'Shift') shiftDown = true;
+});
+window.addEventListener('keyup', (e) => {
+    if (e.key === 'Shift') shiftDown = false;
+});
+
+const wantsMove = () =>
+    moveMode || shiftDown;
+
+function updateFieldCursor(clientX, clientY) {
+
+    if (!fieldCanvas) return;
+
+    const s =
+        sphereAtPoint(clientX, clientY);
+
+    fieldCanvas.style.cursor =
+        s ? (wantsMove() ? 'move' : 'pointer') : 'default';
+}
+
+// Set up once - the canvas exists lazily, but events land on the
+// field container and forward to whichever canvas state exists.
+function attachFieldPointerHandlers() {
+
+    field.addEventListener('pointerdown', (e) => {
+
+        if (!fieldCanvas || e.target !== fieldCanvas) {
+            return;
+        }
+
+        downXY = [e.clientX, e.clientY];
+        dragging = true;
+        dragSphere = sphereAtPoint(e.clientX, e.clientY);
+        moving = dragSphere && wantsMove();
+        lx = e.clientX;
+        ly = e.clientY;
+
+        // The pointerId can be invalidated between the event and
+        // this call (e.g. a touch-scroll cancelled it) - capture is
+        // an optimization, so a failure here shouldn't kill the
+        // interaction.
+        try {
+            fieldCanvas.setPointerCapture(e.pointerId);
+        } catch (err) {
+            console.warn(
+                'field: pointer capture failed (interaction still works):',
+                err.message
+            );
+        }
+
+        if (dragSphere) {
+
+            console.log(
+                `sphere ${dragSphere.id}: pointer down (${moving ? 'MOVE' : 'SPIN'} mode)`
+            );
+        }
+    });
+
+    field.addEventListener('pointermove', (e) => {
+
+        if (!dragging) {
+
+            // Hover feedback only - cursor shows what a press
+            // would do.
+            updateFieldCursor(e.clientX, e.clientY);
+            return;
+        }
+
+        const dx = e.clientX - lx;
+        const dy = e.clientY - ly;
+        lx = e.clientX;
+        ly = e.clientY;
+
+        if (!dragSphere) {
+            return;
+        }
+
+        if (moving) {
+
+            moveSphereTo(
+                dragSphere,
+                dragSphere.centerX + dx,
+                dragSphere.centerY + dy
+            );
+
+            return;
+        }
+
+        dragSphere.phi += dx * 0.01;
+        dragSphere.theta += dy * 0.01;
+    });
+
+    field.addEventListener('pointerup', (e) => {
+
+        if (!dragging) {
+            return;
+        }
+
+        dragging = false;
+
+        const wasAClick =
+            downXY &&
+            Math.hypot(
+                e.clientX - downXY[0],
+                e.clientY - downXY[1]
+            ) < 4;
+
+        downXY = null;
+
+        if (wasAClick) {
+
+            // Plain click selects (so the sidebar drives this
+            // sphere); click on empty space deselects. Double-click
+            // is what opens the file picker / spawns - see below.
+            selectSphere(dragSphere || null);
+        }
+
+        dragSphere = null;
+    });
+
+    // Double-click a sphere to choose an image/GIF for it;
+    // double-click empty space to spawn a new sphere there.
+    field.addEventListener('dblclick', (e) => {
+
+        if (!fieldCanvas || e.target !== fieldCanvas) {
+            return;
+        }
+
+        const s =
+            sphereAtPoint(e.clientX, e.clientY);
+
+        if (s) {
+
+            selectSphere(s);
+            openFilePickerForSphere(s);
+
+        } else {
+
+            spawnSphereAt(e.clientX, e.clientY);
+        }
+    });
+
+    // Drop image/GIF onto a sphere.
+    field.addEventListener('dragover', (e) => {
+        e.preventDefault();
+    });
+
+    field.addEventListener('drop', async (e) => {
+
+        e.preventDefault();
+
+        if (!fieldCanvas || e.target !== fieldCanvas) {
+            return;
+        }
+
+        const file = e.dataTransfer.files[0];
+        const s =
+            sphereAtPoint(e.clientX, e.clientY);
+
+        if (file && s) {
+            await loadFileOntoFieldSphere(s, file);
+        }
+    });
+}
+
+attachFieldPointerHandlers();
+
+// ------------------------------------------------------------
 // Move mode
 // ------------------------------------------------------------
 
@@ -517,8 +893,8 @@ function setMoveMode(on) {
 
     moveMode = on;
 
-    for (const s of fieldSpheres) {
-        s.el.classList.toggle('move-mode', on);
+    if (fieldCanvas) {
+        fieldCanvas.style.cursor = '';
     }
 }
 
@@ -528,9 +904,9 @@ function isMoveMode() {
 }
 
 // ------------------------------------------------------------
-// Deletion
+// Deletion - also frees this sphere's GL textures back to the
+// shared context so long sessions can't slowly exhaust VRAM.
 // ------------------------------------------------------------
-
 function deleteSphere(sphere) {
 
     const idx =
@@ -548,12 +924,12 @@ function deleteSphere(sphere) {
 
     fieldSpheres.splice(idx, 1);
 
-    const ext =
-        sphere.gl.getExtension('WEBGL_lose_context');
+    if (sphere.texture) {
+        gl.deleteTexture(sphere.texture);
+        sphere.texture = null;
+    }
 
-    if (ext) ext.loseContext();
-
-    sphere.el.remove();
+    disposeFieldSphereFrames(sphere);
 }
 
 // Frees the GL textures backing sphere.frames (if any) and clears
@@ -565,7 +941,7 @@ function disposeFieldSphereFrames(sphere) {
     if (sphere.frames) {
 
         for (const f of sphere.frames) {
-            sphere.gl.deleteTexture(f.texture);
+            gl.deleteTexture(f.texture);
         }
 
         sphere.frames = null;
@@ -642,8 +1018,8 @@ function regenerateFieldSphereTexture(sphere) {
     }
 
     // Field spheres bake at 1024x512 (vs. the main globe's 2048x1024)
-    // - keeps per-sphere GPU memory modest, since up to 9 of these
-    // WebGL contexts can be active at once.
+    // - keeps per-sphere GPU memory modest, since every textured
+    // sphere holds its own copy of this in the shared context.
     const canvas =
         generateGlobeTexture(
             source,
@@ -653,15 +1029,15 @@ function regenerateFieldSphereTexture(sphere) {
         );
 
     if (sphere.texture) {
-        sphere.gl.deleteTexture(sphere.texture);
+        gl.deleteTexture(sphere.texture);
     }
 
     sphere.texture =
-        uploadTex(sphere.gl, canvas);
+        uploadTex(canvas);
 
     disposeFieldSphereFrames(sphere);
 
-    renderFieldSphere(sphere, sphere.phi, sphere.theta);
+    renderFieldSphere();
 }
 
 // Changes how many faces a field sphere shows (1/2/3/4/6, same
@@ -875,21 +1251,21 @@ export async function loadFileOntoFieldSphere(sphere, file, faceIndex = 0) {
             sphere.faceImages = {};
 
             if (sphere.texture) {
-                sphere.gl.deleteTexture(sphere.texture);
+                gl.deleteTexture(sphere.texture);
                 sphere.texture = null;
             }
 
             disposeFieldSphereFrames(sphere);
 
             sphere.frames = baked.map(b => ({
-                texture: uploadTex(sphere.gl, b.canvas),
+                texture: uploadTex(b.canvas),
                 delay: b.delay
             }));
 
             sphere.frameIndex = 0;
             sphere.elapsedMs = 0;
 
-            renderFieldSphere(sphere, sphere.phi, sphere.theta);
+            renderFieldSphere();
 
         } else {
 
@@ -923,7 +1299,7 @@ export async function loadFileOntoFieldSphere(sphere, file, faceIndex = 0) {
     }
 }
 
-function uploadTex(gl, source) {
+function uploadTex(source) {
 
     const t = gl.createTexture();
 
@@ -941,137 +1317,12 @@ function uploadTex(gl, source) {
     return t;
 }
 
-function renderFieldSphere(sphere, phiVal, thetaVal) {
-
-    const gl = sphere.gl;
-
-    gl.useProgram(sphere.program);
-
-    gl.uniform1f(sphere.uniforms.phi, phiVal);
-    gl.uniform1f(sphere.uniforms.theta, thetaVal);
-
-    gl.activeTexture(gl.TEXTURE0);
-
-    if (sphere.frames && sphere.frames.length > 0) {
-
-        const frame =
-            sphere.frames[
-                sphere.frameIndex % sphere.frames.length
-            ];
-
-        gl.bindTexture(gl.TEXTURE_2D, frame.texture);
-
-    } else if (sphere.texture) {
-
-        // Explicit on purpose (rather than relying on whatever
-        // texture uploadTex() last left bound): without this, a
-        // static image uploaded onto a sphere that was previously
-        // showing a GIF never actually appeared - sphere.texture got
-        // updated, but the GIF's last frame stayed bound and kept
-        // being drawn every tick since nothing told the GPU to
-        // switch.
-        gl.bindTexture(gl.TEXTURE_2D, sphere.texture);
-    }
-
-    gl.clearColor(0, 0, 0, 0);
-    gl.clear(gl.COLOR_BUFFER_BIT);
-    gl.drawArrays(gl.TRIANGLES, 0, 6);
-}
-
-// ------------------------------------------------------------
-// Field animation loop - advances every sphere's rotation and GIF
-// playback on one shared rAF. Rotation behavior (spin type, speed,
-// pause) comes from each sphere's own controls object, which the
-// sidebar writes into for the selected sphere.
-// ------------------------------------------------------------
-let fieldRunning = false;
-
-function fieldTick(ts) {
-
-    if (!field.classList.contains('active')) {
-
-        fieldRunning = false;
-        return;
-    }
-
-    for (const s of fieldSpheres) {
-
-        if (s.lastTs !== null) {
-
-            const dt = ts - s.lastTs;
-            const c = s.controls;
-
-            if (!c.paused) {
-
-                if (c.spinType === 'axis') {
-
-                    s.phi +=
-                        PHI_RATE *
-                        c.spinSpeedMultiplier *
-                        dt / 16.7;
-
-                } else {
-
-                    s.phi +=
-                        PHI_RATE *
-                        c.spinSpeedMultiplier *
-                        dt / 16.7;
-
-                    s.theta +=
-                        THETA_RATE *
-                        c.spinSpeedMultiplier *
-                        dt / 16.7;
-                }
-            }
-
-            if (s.frames && s.frames.length > 0) {
-
-                s.elapsedMs += dt;
-
-                let guard = 0;
-
-                while (
-                    s.elapsedMs >=
-                        s.frames[s.frameIndex].delay &&
-                    guard < s.frames.length
-                ) {
-
-                    s.elapsedMs -=
-                        s.frames[s.frameIndex].delay;
-
-                    s.frameIndex =
-                        (s.frameIndex + 1) %
-                        s.frames.length;
-
-                    guard++;
-                }
-            }
-        }
-
-        s.lastTs = ts;
-
-        renderFieldSphere(s, s.phi, s.theta);
-    }
-
-    requestAnimationFrame(fieldTick);
-}
-
-function startFieldLoop() {
-
-    if (fieldRunning) return;
-
-    fieldRunning = true;
-    requestAnimationFrame(fieldTick);
-}
-
 // ------------------------------------------------------------
 // Public controls (used by main.js's sidebar bridge)
 // ------------------------------------------------------------
 
-// Rotation rates matching the main globe's animate() loop, so the
-// Spin speed slider means the same thing in both modes.
-const PHI_RATE = 0.002;
-const THETA_RATE = 0.0007;
+// All of these just write sphere state now - renderField() uploads
+// the per-sphere uniforms on every frame, so no GL calls here.
 
 function setSphereDots(sphere, v) {
 
@@ -1080,9 +1331,6 @@ function setSphereDots(sphere, v) {
     console.log(`sphere ${sphere.id}: dots = ${v}`);
 
     sphere.controls.dots = v;
-
-    sphere.gl.useProgram(sphere.program);
-    sphere.gl.uniform1f(sphere.uniforms.dots, v);
 }
 
 function setSphereScale(sphere, v) {
@@ -1093,50 +1341,10 @@ function setSphereScale(sphere, v) {
 
     sphere.controls.scale = v;
 
-    sphere.gl.useProgram(sphere.program);
-    sphere.gl.uniform1f(sphere.uniforms.scale, v);
-
-    // The selection marker is a FIXED-SIZE badge ring (see CSS) -
-    // it never grows with the sphere. When the sphere's rendered
-    // disc outgrows the badge, the badge turns red so you can still
-    // spot it on/around the giant sphere.
-    resizeSphereCanvas(sphere);
-}
-
-// Sizes/colors the selection marker for a sphere. Rendered disc
-// radius in px is (baseSize/2) / scale (shader: r = 0.8/(scale*0.8)
-// of the half-canvas), clamped by the canvas edge.
-function updateSelectionMarker(sphere) {
-
-    if (!sphere) return;
-
-    const el = sphere.el;
-    const scale = Math.max(0.05, sphere.controls.scale || 1);
-
-    // Disc radius as fraction of the canvas (max 100% - the canvas
-    // clips anything bigger).
-    const discFraction = Math.min(1, 1 / scale);
-
-    // Marker diameter: the disc size, but never larger than 36px.
-    // Once the disc exceeds that, the marker sits ON the sphere
-    // (red) instead of surrounding it (blue).
-    const discPx = discFraction * sphere.baseSize;
-    const markerDiameter = Math.min(discPx, 36);
-    const overflow = discPx > 36;
-
-    el.style.setProperty(
-        '--sel-size',
-        `${markerDiameter}px`
-    );
-
-    el.classList.toggle('marker-overflow', overflow);
-
-    if (el.classList.contains('selected')) {
-
-        console.log(
-            `sphere ${sphere.id}: selection marker ${overflow ? 'OVERFLOW (red, on-sphere)' : 'surrounding'} - disc ${discPx.toFixed(0)}px`
-        );
-    }
+    // The selection marker never grows with the sphere - when the
+    // disc outgrows the 36px badge, the badge turns red and sits on
+    // the sphere so it stays findable.
+    updateSelectionMarker();
 }
 
 function setSphereGlowColor(sphere, rgb01) {
@@ -1148,14 +1356,6 @@ function setSphereGlowColor(sphere, rgb01) {
     );
 
     sphere.controls.glowColor = rgb01;
-
-    sphere.gl.useProgram(sphere.program);
-    sphere.gl.uniform3f(
-        sphere.uniforms.glowColor,
-        rgb01[0],
-        rgb01[1],
-        rgb01[2]
-    );
 }
 
 function setSphereOpacity(sphere, v) {
@@ -1165,9 +1365,6 @@ function setSphereOpacity(sphere, v) {
     console.log(`sphere ${sphere.id}: opacity = ${v}`);
 
     sphere.controls.opacity = v;
-
-    sphere.gl.useProgram(sphere.program);
-    sphere.gl.uniform1f(sphere.uniforms.opacity, v);
 }
 
 function setSphereIgnoreAlpha(sphere, on) {
@@ -1179,12 +1376,6 @@ function setSphereIgnoreAlpha(sphere, on) {
     );
 
     sphere.controls.ignoreAlpha = on ? 1 : 0;
-
-    sphere.gl.useProgram(sphere.program);
-    sphere.gl.uniform1f(
-        sphere.uniforms.uIgnoreAlpha,
-        on ? 1 : 0
-    );
 }
 
 function setSpherePaused(sphere, on) {
@@ -1244,12 +1435,6 @@ function setSphereUseDots(sphere, v) {
     console.log(`sphere ${sphere.id}: useDots (fibonacci mode) = ${v}`);
 
     sphere.controls.useDots = v;
-
-    sphere.gl.useProgram(sphere.program);
-    sphere.gl.uniform1f(
-        sphere.uniforms.uUseDots,
-        v
-    );
 }
 
 // Push the selected sphere's current control values back into the
@@ -1264,15 +1449,18 @@ function getSphereControls(sphere) {
 // ------------------------------------------------------------
 export function openSphereField() {
 
+    ensureFieldCanvas();
+
     field.classList.add('active');
     startFieldLoop();
 }
 
 // Leaves field mode entirely: tears every sphere down (freeing the
-// WebGL contexts) and clears the selection, so the app is back to
-// the plain single-globe view. The ID counter restarts too, so the
-// next session's spheres are labeled 1..N again instead of
-// continuing from wherever the last session left off.
+// shared-context textures) and clears the selection, so the app is
+// back to the plain single-globe view. The ID counter restarts too,
+// so the next session's spheres are labeled 1..N again instead of
+// continuing from wherever the last session left off. The canvas
+// and its context stay alive for the next visit.
 export function closeSphereField() {
 
     for (const s of [...fieldSpheres]) {
@@ -1288,35 +1476,89 @@ export function closeSphereField() {
 
 export function spawnSphereAt(x, y, size = 160) {
 
-    if (fieldSpheres.length >= MAX_FIELD_SPHERES) {
+    if (fieldSpheres.length >= HARD_LIMIT) {
 
         alert(
-            `Browser WebGL context limit reached (~${MAX_FIELD_SPHERES} spheres). ` +
+            `That's ${HARD_LIMIT} spheres - your tab would be unusable. ` +
             'Remove some spheres first.'
         );
 
         return null;
     }
 
+    ensureFieldCanvas();
+
     const s =
         createFieldSphere(x, y, size);
 
-    if (s) {
+    fieldSpheres.push(s);
 
-        fieldSpheres.push(s);
+    renderFieldSphere();
 
-        renderFieldSphere(s, s.phi, s.theta);
+    console.log(
+        `sphere ${s.id}: spawned at (${Math.round(x)}, ${Math.round(y)}) size ${size}px (${fieldSpheres.length} active)`
+    );
 
-        console.log(
-            `sphere ${s.id}: spawned at (${Math.round(x)}, ${Math.round(y)}) size ${size}px (${fieldSpheres.length} active)`
-        );
-
-        // New spheres become the active selection immediately, so
-        // the sidebar drives the thing you just made.
-        selectSphere(s);
-    }
+    // New spheres become the active selection immediately, so
+    // the sidebar drives the thing you just made.
+    selectSphere(s);
 
     return s;
+}
+
+// Console/test helper: spawn n spheres spread over the viewport in
+// a grid, e.g. fieldAPI.spawnMany(2000). Spheres start empty
+// (transparent 1x1 texture, no per-sphere VRAM), so this measures
+// pure renderer throughput.
+function spawnMany(n, size = 160) {
+
+    ensureFieldCanvas();
+
+    const cols =
+        Math.max(1, Math.ceil(Math.sqrt(n)));
+
+    const cellW =
+        window.innerWidth / cols;
+
+    const cellH =
+        window.innerHeight / Math.max(1, Math.ceil(n / cols));
+
+    const made = [];
+
+    for (let i = 0; i < n; i++) {
+
+        const cx =
+            (i % cols + 0.5) * cellW;
+
+        const cy =
+            (Math.floor(i / cols) + 0.5) * cellH;
+
+        const s =
+            createFieldSphere(cx, cy, size);
+
+        // Shrink to fit the grid cell (a scale of cssBox terms -
+        // baseSize stays the disc-at-scale-1 size, so clamp scale
+        // so the box fits without full overlap).
+        const fit =
+            Math.min(cellW, cellH) * DISC_FRACTION / size;
+
+        s.controls.scale = Math.max(0.05, Math.min(1, fit));
+
+        fieldSpheres.push(s);
+        made.push(s);
+
+        if (fieldSpheres.length >= HARD_LIMIT) {
+            break;
+        }
+    }
+
+    renderField();
+
+    console.log(
+        `field: spawned ${made.length} spheres (${fieldSpheres.length} total)`
+    );
+
+    return made;
 }
 
 export function clearFieldSpheres() {
@@ -1347,22 +1589,6 @@ export {
     setSphereFaceCount,
     getSphereControls
 };
-
-// Double-click empty space spawns a sphere there.
-field.addEventListener('dblclick', (e) => {
-
-    if (e.target === field) {
-        spawnSphereAt(e.clientX, e.clientY);
-    }
-});
-
-// Click empty field space deselects.
-field.addEventListener('pointerdown', (e) => {
-
-    if (e.target === field && selectedSphere) {
-        selectSphere(null);
-    }
-});
 
 // Escape: deselect a sphere if one is selected, otherwise close the
 // field back to the main globe.
@@ -1402,3 +1628,15 @@ window.addEventListener('keydown', (e) => {
         setMoveMode(!moveMode);
     }
 });
+
+// Small debug/testing surface (no UI depends on it):
+//   fieldAPI.spawnMany(1000)   - stress test
+//   fieldAPI.count()           - how many are live
+window.fieldAPI = {
+    spawnAt: spawnSphereAt,
+    spawnMany,
+    load: loadFileOntoFieldSphere,
+    count: () => fieldSpheres.length,
+    spheres: () => fieldSpheres,
+    select: selectSphere
+};

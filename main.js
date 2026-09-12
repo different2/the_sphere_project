@@ -2163,7 +2163,53 @@ async function regenerateCustomImageTexture() {
 // that images use. Called whenever the text box changes.
 // ============================================================
 
+// Convert a data: URL into a File, for handing CPU-baked canvases
+// (e.g. the typed-text texture) to the File-based upload path
+// (loadFileOntoFieldSphere) without a real user file.
+async function dataUrlToFile(dataUrl, name) {
+
+    const blob =
+        await (await fetch(dataUrl)).blob();
+
+    return new File([blob], name, { type: blob.type || 'image/png' });
+}
+
 async function applyCustomText(text) {
+
+    // Field mode with a selected sphere: the typed text becomes a
+    // full-wrap image on THAT sphere (baked at the field's 1024x512
+    // resolution), not the main globe - same routing rule the Upload
+    // Image control already follows. Text itself never animates and
+    // doesn't use the multi-face system, so slot 0 via the normal
+    // upload path is the whole feature; setFaceImage's "new primary"
+    // rule (drop face overrides, stop any GIF) applies for free.
+    const fieldTarget_ = fieldTarget();
+
+    if (fieldTarget_) {
+
+        debugLog(
+            `applyCustomText routed: field sphere ${fieldTarget_.id}`
+        );
+
+        const textCanvas =
+            createTextTexture(text);
+
+        const file =
+            await dataUrlToFile(
+                textCanvas.toDataURL('image/png'),
+                'typed-text.png'
+            );
+
+        loadFileOntoFieldSphere(
+            fieldTarget_,
+            file,
+            0
+        ).then(() => {
+            renderFaceSlotThumbnails();
+        });
+
+        return;
+    }
 
     clearAllFaceSlots();
 
@@ -3854,6 +3900,124 @@ function renderFaceSlotThumbnails() {
     );
 }
 
+// ============================================================
+// Dynamic assets-folder entries in the Texture dropdown
+//
+// The server (server.py) exposes GET /_assets-list returning the
+// image files currently in assets/. This fetches it, adds each file
+// under an "Assets folder" group, and re-checks every few seconds -
+// so adding/removing files in assets/ updates the menu live, no
+// restart. If the endpoint is missing (plain `python3 -m
+// http.server` or static hosting) the fetch 404s and the dropdown
+// simply keeps its hand-written options - the app still fully works.
+// ============================================================
+
+let assetNamesLoaded = [];
+
+function applyAssetOptions(names) {
+
+    const signature = names.join('|');
+
+    if (signature === assetNamesLoaded.map(n => n).join('|')) {
+        return; // unchanged
+    }
+
+    assetNamesLoaded = names;
+
+    // drop any previously added asset options (and the group)
+    textureSelect
+        .querySelectorAll('option[data-asset],optgroup[data-asset-group]')
+        .forEach(el => el.remove());
+
+    if (names.length === 0) {
+        return;
+    }
+
+    const group =
+        document.createElement('optgroup');
+
+    group.label = 'Assets folder';
+    group.dataset.assetGroup = '1';
+
+    for (const name of names) {
+
+        // files the built-in presets already load stay hidden:
+        // 'Laughing Man' uses laughingman.gif (6-face bake) and
+        // 'Earth Map' uses 8k_earth_daymap.jpg - listing them
+        // again as raw uploads would be confusing duplicates.
+        if (
+            name === 'laughingman.gif' ||
+            name === 'laughingman.png' ||
+            name === '8k_earth_daymap.jpg'
+        ) {
+            continue;
+        }
+
+        const opt =
+            document.createElement('option');
+
+        opt.value = 'file:' + name;
+        opt.textContent = name.replace(/\.[^.]+$/, '');
+        opt.dataset.asset = '1';
+        group.appendChild(opt);
+    }
+
+    // (optgroup elements have no .options collection - that's a
+    // select-element property - so count children directly)
+    if (group.childElementCount > 0) {
+
+        // insert before the custom presets (Upload Image is last)
+        textureSelect.insertBefore(
+            group,
+            textureSelect.options[textureSelect.options.length - 1] || null
+        );
+    }
+}
+
+async function refreshAssetOptions() {
+
+    try {
+
+        const resp =
+            await fetch('_assets-list', { cache: 'no-store' });
+
+        if (!resp.ok) {
+
+            // static hosting / plain http.server: stay on the
+            // hand-written options, stop polling
+            console.log(
+                'assets list endpoint unavailable; texture menu stays static'
+            );
+
+            return false;
+        }
+
+        applyAssetOptions(await resp.json());
+        return true;
+
+    } catch (err) {
+
+        return false;
+    }
+}
+
+let assetPollTimer = null;
+
+// exposed for console testing / the dynamic-menu feature check
+window.__assetsMenu = { refresh: refreshAssetOptions, apply: applyAssetOptions };
+
+(async () => {
+
+    const available =
+        await refreshAssetOptions();
+
+    if (available) {
+
+        assetPollTimer =
+            setInterval(refreshAssetOptions, 4000);
+    }
+})();
+
 if (
     textureSelect &&
     fileUpload
@@ -3870,6 +4034,123 @@ if (
                 "Texture selected:",
                 selectedTexture
             );
+
+            // ------------------------------------------------
+            // Assets-folder entries (file:<name>, added to the
+            // dropdown by the dynamic loader below): load the
+            // file as an upload would, so the FULL upload
+            // pipeline applies on both targets - a .gif animates
+            // (whole-wrap on a single-face globe, per-face
+            // animation when faces > 1), a static image wraps
+            // (or fills the current face layout).
+            // ------------------------------------------------
+            if (selectedTexture.startsWith('file:')) {
+
+                const assetName =
+                    selectedTexture.slice(5);
+
+                debugLog(
+                    `textureSelect: asset '${assetName}'`
+                );
+
+                try {
+
+                    const resp =
+                        await fetch('assets/' + encodeURIComponent(assetName));
+
+                    if (!resp.ok) {
+
+                        throw new Error(
+                            `assets/${assetName} responded ${resp.status} - was the file removed?`
+                        );
+                    }
+
+                    const blob =
+                        await resp.blob();
+
+                    const file =
+                        new File([blob], assetName, { type: blob.type });
+
+                    lastUploadedFileName = assetName;
+
+                    const target = fieldTarget();
+
+                    if (target) {
+
+                        await loadFileOntoFieldSphere(
+                            target,
+                            file,
+                            0
+                        );
+
+                        renderFaceSlotThumbnails();
+                        showUploadStatusIdle();
+
+                        return;
+                    }
+
+                    if (file.type === 'image/gif') {
+
+                        if (
+                            activeCustomKind === 'image' &&
+                            faceCount > 1
+                        ) {
+
+                            // Same rule as a manual GIF upload:
+                            // multi-face mode makes it face 1's
+                            // own animated content.
+                            applyFaceSlotGif(
+                                await file.arrayBuffer(),
+                                0
+                            );
+
+                        } else {
+
+                            applyAnimatedGif(
+                                await file.arrayBuffer()
+                            );
+                        }
+
+                    } else {
+
+                        const img =
+                            new Image();
+
+                        const url =
+                            URL.createObjectURL(blob);
+
+                        await new Promise((resolve, reject) => {
+
+                            img.onload = resolve;
+                            img.onerror = reject;
+                            img.src = url;
+                        });
+
+                        await applyCustomImage(img);
+
+                        URL.revokeObjectURL(url);
+
+                        renderFaceSlotThumbnails();
+                    }
+
+                    showUploadStatusIdle();
+
+                } catch (err) {
+
+                    console.error(
+                        `asset '${assetName}' failed to load:`,
+                        err
+                    );
+
+                    if (uploadStatus) {
+
+                        uploadStatus.textContent =
+                            `Could not load ${assetName}`;
+                    }
+                }
+
+                return;
+            }
 
             // ------------------------------------------------
             // Custom uploaded image
@@ -3938,6 +4219,108 @@ if (
                         (customTextInput.value || 'HELLO WORLD!') :
                         'HELLO WORLD!'
                 );
+
+                return;
+            }
+
+            // ------------------------------------------------
+            // Field mode with a selected sphere: the preset
+            // loads onto THAT sphere through the same bake
+            // path an image/GIF upload uses, instead of
+            // replacing the main globe's texture. Same
+            // routing rule Upload Image and the text box
+            // already follow (see fieldTarget checks there).
+            // ------------------------------------------------
+            const fieldPresetTarget = fieldTarget();
+
+            if (
+                fieldPresetTarget &&
+                (
+                    selectedTexture === 'laughingMan' ||
+                    textures[selectedTexture]
+                )
+            ) {
+
+                syncTextureSelect(selectedTexture);
+
+                // Whatever custom control was up (text box / upload
+                // row) makes no sense for a preset - hide it, same
+                // as the main-globe preset path below.
+                setContextualControlsVisible({});
+
+                debugLog(
+                    `textureSelect: preset '${selectedTexture}' routed to field sphere ${fieldPresetTarget.id}`
+                );
+
+                const isLaughingMan =
+                    selectedTexture === 'laughingMan';
+
+                // Match the main globe's preset look: Laughing Man
+                // is the classic 6-logo face layout (4 equator +
+                // poles), every other preset is a single full wrap.
+                fieldPresetTarget.faceCount =
+                    isLaughingMan ? 6 : 1;
+
+                faceCountInputs.forEach((input) => {
+
+                    input.checked =
+                        parseInt(input.value, 10) === fieldPresetTarget.faceCount;
+                });
+
+                const candidateUrls = isLaughingMan
+                    ? [textures.laughingManGif, textures.laughingMan]
+                    : [textures[selectedTexture]];
+
+                (async () => {
+
+                    let blob = null;
+                    let fileName = selectedTexture + '.png';
+                    let mime = 'image/png';
+
+                    for (const url of candidateUrls) {
+
+                        try {
+
+                            const resp = await fetch(url);
+
+                            if (!resp.ok) continue;
+
+                            blob = await resp.blob();
+
+                            if (url.endsWith('.gif')) {
+
+                                fileName = 'laughingman.gif';
+                                mime = 'image/gif';
+                            }
+
+                            break;
+
+                        } catch (err) {
+                            console.warn(
+                                `preset source ${url} unavailable:`,
+                                err.message
+                            );
+                        }
+                    }
+
+                    if (!blob) {
+
+                        console.error(
+                            `preset '${selectedTexture}' has no loadable source for field spheres`
+                        );
+
+                        return;
+                    }
+
+                    await loadFileOntoFieldSphere(
+                        fieldPresetTarget,
+                        new File([blob], fileName, { type: mime }),
+                        0
+                    );
+
+                    renderFaceSlotThumbnails();
+
+                })();
 
                 return;
             }
