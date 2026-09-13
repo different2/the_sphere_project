@@ -914,8 +914,25 @@ const fragmentShader = /*glsl*/`
 
                     /*
                      * Keep the blue atmospheric glow.
+                     *
+                     * The Fresnel band (bright near the limb) used
+                     * to add ONLY to rgb (layer.xyz += ...) on this
+                     * transparent canvas - color without alpha.
+                     * Whether you could see it then depended on
+                     * Chrome's compositing path for the day (with
+                     * the sidebar's backdrop-filter active, the
+                     * canvas took a color-managed path where the
+                     * un-alpha'd glow showed; closed-slide path ate
+                     * it) - which is the "menu open = sharp glow,
+                     * menu closed = dull" effect. Adding the glow
+                     * contribution to alpha too makes it a REAL
+                     * painted pixel on any path, so it's the
+                     * default look everywhere: inside the disc the
+                     * ring now also darkens any backdrop behind
+                     * (black anyway - no visual change) and outside,
+                     * where it always lives additively, it's brighter.
                      */
-                    layer.xyz +=
+                    float fresnel =
                         pow(
                             1. -
                             max(
@@ -923,9 +940,25 @@ const fragmentShader = /*glsl*/`
                                 0.0
                             ),
                             4.
-                        )
+                        );
+
+                    layer.xyz +=
+                        fresnel
                         *
                         glowColor;
+
+                    layer.w +=
+                        fresnel
+                        *
+                        max(
+                            glowColor.r,
+                            max(
+                                glowColor.g,
+                                glowColor.b
+                            )
+                        )
+                        *
+                        opacity;
 
 
                     color +=
@@ -1118,7 +1151,7 @@ const fragmentShader = /*glsl*/`
                         );
 
 
-                    layer.xyz +=
+                    float dotFresnel =
                         pow(
                             1. -
                             max(
@@ -1126,9 +1159,31 @@ const fragmentShader = /*glsl*/`
                                 0.0
                             ),
                             4.
-                        )
+                        );
+
+                    layer.xyz +=
+                        dotFresnel
                         *
                         glowColor;
+
+                    // same real-alpha treatment as crisp mode above:
+                    // rgb-only glow is invisible on premultiplied
+                    // compositing paths (Chrome) and visible on
+                    // straight ones (Firefox) - alpha makes it
+                    // consistent everywhere. Capped so the existing
+                    // 0.9 base never spills past fully opaque.
+                    layer.w = min(
+                        layer.w +
+                        dotFresnel *
+                        max(
+                            glowColor.r,
+                            max(
+                                glowColor.g,
+                                glowColor.b
+                            )
+                        ),
+                        1.0
+                    );
 
 
                     color +=
