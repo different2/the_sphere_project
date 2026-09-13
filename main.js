@@ -48,7 +48,10 @@ import {
     setSphereTheta,
     setSphereUseDots,
     setSphereFaceCount,
-    getSphereControls
+    getSphereControls,
+    serializeFieldState,
+    loadFieldState,
+    setSphereTextSource
 } from './sphere-field.js';
 
 const vertexShader = `
@@ -2174,6 +2177,53 @@ async function dataUrlToFile(dataUrl, name) {
     return new File([blob], name, { type: blob.type || 'image/png' });
 }
 
+// The text to apply when the Texture dropdown switches to Text
+// Message. Unlike live typing in the box (which always means "this"),
+// choosing the OPTION with a stale or empty box shouldn't silently
+// bake words: empty asks instead, and text that differs from the
+// selected sphere's own stored text confirms before replacing.
+// Returns null when the user cancelled / gave nothing.
+function resolveTypedText() {
+
+    const box =
+        customTextInput ? customTextInput.value : '';
+
+    const target = fieldTarget();
+
+    if (!box.trim()) {
+
+        const typed =
+            prompt('Type the text to put on the sphere:');
+
+        if (!typed || !typed.trim()) {
+            return null;
+        }
+
+        if (customTextInput) {
+            customTextInput.value = typed;
+        }
+
+        return typed;
+    }
+
+    const own = target && target.textSources && target.textSources[0];
+
+    if (own != null && own !== box) {
+
+        if (!confirm(`Replace this sphere's text "${own}" with "${box}"?`)) {
+
+            // keep editing: put the sphere's real text back
+            if (customTextInput) {
+                customTextInput.value = own;
+            }
+
+            return null;
+        }
+    }
+
+    return box;
+}
+
 async function applyCustomText(text) {
 
     // Field mode with a selected sphere: the typed text becomes a
@@ -2205,6 +2255,10 @@ async function applyCustomText(text) {
             file,
             0
         ).then(() => {
+            // Remember the literal string behind that upload so the
+            // Text Message option can put it back in the box for
+            // editing (see setSphereTextSource / restoreFieldText).
+            setSphereTextSource(fieldTarget_, text);
             renderFaceSlotThumbnails();
         });
 
@@ -3517,6 +3571,15 @@ if (customTextInput) {
                 setTimeout(
                     () => {
 
+                        // An emptied box means "I'm mid-edit", not
+                        // "bake the fallback string" - skip. (The
+                        // field path AND the main-globe path both
+                        // would otherwise render HELLO WORLD! from
+                        // createTextTexture's empty-string default.)
+                        if (!value.trim()) {
+                            return;
+                        }
+
                         applyCustomText(value);
 
                     },
@@ -4214,11 +4277,18 @@ if (
 
                 setUseDots(true);
 
-                await applyCustomText(
-                    customTextInput ?
-                        (customTextInput.value || 'HELLO WORLD!') :
-                        'HELLO WORLD!'
-                );
+                // Don't blindly apply the box's current contents -
+                // after selecting an image sphere the box is EMPTY
+                // (and after another text sphere it holds stale
+                // words). resolveTypedText asks/confirms instead of
+                // silently baking 'HELLO WORLD!' or the wrong text.
+                const toApply =
+                    resolveTypedText();
+
+                if (toApply != null) {
+
+                    await applyCustomText(toApply);
+                }
 
                 return;
             }
@@ -5244,6 +5314,539 @@ if (controlsPanel && sidebarToggle) {
     );
 }
 
+// ============================================================
+// Sphere-field PRESETS
+//
+// Save the whole current field (every sphere: position, size, spin,
+// faces, AND its uploaded images) under a name, and reload it later
+// - including after a page reload. "Where I left off, editable
+// again": loading re-runs every stored image through the normal
+// upload path, so loaded spheres behave exactly like freshly
+// spawned ones (upload on top, move, tweak, re-save over the
+// preset - a same-named re-save overwrites instead of duplicating).
+//
+// Storage is IndexedDB ('spherePresets'): File/Blob bytes are
+// stored natively (localStorage can't hold them and caps at ~5MB),
+// so multi-MB GIF frames work. The small index (names, timestamps,
+// counts) lives in localStorage.
+// ============================================================
+
+const PRESET_DB_NAME = 'spherePresets';
+const PRESET_STORE = 'presets';
+
+function openPresetDb() {
+
+    return new Promise((resolve, reject) => {
+
+        const req = indexedDB.open(PRESET_DB_NAME, 1);
+
+        req.onupgradeneeded = () => {
+
+            if (!req.result.objectStoreNames.contains(PRESET_STORE)) {
+                req.result.createObjectStore(PRESET_STORE);
+            }
+        };
+
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+    });
+}
+
+async function presetDbPut(key, value) {
+
+    const db = await openPresetDb();
+
+    return new Promise((resolve, reject) => {
+
+        const tx = db.transaction(PRESET_STORE, 'readwrite');
+        tx.objectStore(PRESET_STORE).put(value, key);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+    });
+}
+
+async function presetDbGet(key) {
+
+    const db = await openPresetDb();
+
+    return new Promise((resolve, reject) => {
+
+        const req =
+            db.transaction(PRESET_STORE).objectStore(PRESET_STORE).get(key);
+
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+    });
+}
+
+async function presetDbDelete(key) {
+
+    const db = await openPresetDb();
+
+    return new Promise((resolve, reject) => {
+
+        const tx = db.transaction(PRESET_STORE, 'readwrite');
+        tx.objectStore(PRESET_STORE).delete(key);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+    });
+}
+
+// localStorage mirror: [{key, name, count, savedAt}]
+function presetIndex() {
+
+    try {
+        return JSON.parse(localStorage.getItem('spherePresetIndex') || '[]');
+    } catch {
+        return [];
+    }
+}
+
+function presetIndexSave(list) {
+
+    localStorage.setItem('spherePresetIndex', JSON.stringify(list));
+}
+
+function presetUiRefresh() {
+
+    const sel = document.getElementById('presetSelect');
+
+    if (!sel) return;
+
+    const list = presetIndex();
+    const current = sel.value;
+
+    sel.innerHTML = '';
+
+    if (list.length === 0) {
+
+        const opt = document.createElement('option');
+        opt.value = '';
+        opt.textContent = '(no presets saved yet)';
+        sel.appendChild(opt);
+        sel.disabled = true;
+
+        return;
+    }
+
+    sel.disabled = false;
+
+    for (const entry of list) {
+
+        const opt = document.createElement('option');
+
+        opt.value = entry.key;
+        opt.textContent =
+            `${entry.name} (${entry.count}) ${new Date(entry.savedAt).toLocaleDateString()}`;
+
+        sel.appendChild(opt);
+    }
+
+    if (list.some(e => e.key === current)) {
+        sel.value = current;
+    }
+}
+
+const presetStatus =
+    document.getElementById('presetStatus');
+
+function presetMsg(text, isError = false) {
+
+    if (presetStatus) {
+
+        presetStatus.textContent = text;
+        presetStatus.classList.toggle('error', isError);
+    }
+}
+
+async function savePreset() {
+
+    const count =
+        window.fieldAPI ? window.fieldAPI.count() : 0;
+
+    if (count === 0) {
+
+        presetMsg('Nothing to save - spawn some spheres first.', true);
+        return;
+    }
+
+    const name =
+        prompt('Preset name:', `Field ${new Date().toLocaleDateString()}`);
+
+    if (!name) return;
+
+    const btn = document.getElementById('presetSaveBtn');
+    if (btn) btn.disabled = true;
+
+    try {
+
+        presetMsg(`Saving ${count} spheres...`);
+
+        const state = serializeFieldState();
+        const key = 'p' + Date.now();
+
+        await presetDbPut(key, state);
+
+        const list = presetIndex();
+        const dup = list.find(e => e.name === name);
+
+        if (dup) {
+
+            // same name = overwrite (delete the old record first)
+            await presetDbDelete(dup.key);
+            dup.key = key;
+            dup.count = state.spheres.length;
+            dup.savedAt = Date.now();
+
+        } else {
+
+            list.push({
+                key,
+                name,
+                count: state.spheres.length,
+                savedAt: Date.now()
+            });
+        }
+
+        presetIndexSave(list);
+        presetUiRefresh();
+
+        if (btn) {
+
+            const sel = document.getElementById('presetSelect');
+            if (sel) sel.value = key;
+        }
+
+        presetMsg(
+            `Saved '${name}' (${count} spheres, ${state.blobs.length} images).`
+        );
+
+    } catch (err) {
+
+        console.error('preset save failed:', err);
+        presetMsg(`Save failed: ${err.message}`, true);
+
+    } finally {
+
+        if (btn) btn.disabled = false;
+    }
+}
+
+async function loadPreset() {
+
+    const sel = document.getElementById('presetSelect');
+
+    if (!sel || !sel.value) {
+        presetMsg('Pick a preset first.', true);
+        return;
+    }
+
+    const btn = document.getElementById('presetLoadBtn');
+    if (btn) btn.disabled = true;
+
+    try {
+
+        presetMsg('Loading (re-baking stored images)...');
+
+        const state = await presetDbGet(sel.value);
+
+        if (!state) {
+
+            presetMsg('That preset is missing from storage.', true);
+            return;
+        }
+
+        const n = await loadFieldState(state);
+
+        const entry = presetIndex().find(e => e.key === sel.value);
+
+        presetMsg(
+            `Loaded '${entry ? entry.name : 'preset'}' - ${n} spheres, ready to edit.`
+        );
+
+    } catch (err) {
+
+        console.error('preset load failed:', err);
+        presetMsg(`Load failed: ${err.message}`, true);
+
+    } finally {
+
+        if (btn) btn.disabled = false;
+    }
+}
+
+async function deletePreset() {
+
+    const sel = document.getElementById('presetSelect');
+
+    if (!sel || !sel.value) return;
+
+    const list = presetIndex();
+    const entry = list.find(e => e.key === sel.value);
+
+    if (!entry) return;
+
+    if (!confirm(`Delete preset '${entry.name}'?`)) {
+        return;
+    }
+
+    try {
+
+        await presetDbDelete(entry.key);
+        presetIndexSave(list.filter(e => e.key !== entry.key));
+        presetUiRefresh();
+        presetMsg(`Deleted '${entry.name}'.`);
+
+    } catch (err) {
+
+        presetMsg(`Delete failed: ${err.message}`, true);
+    }
+}
+
+const presetSaveBtn =
+    document.getElementById('presetSaveBtn');
+
+// ------------------------------------------------------------
+// Export / Import: presets as portable .json FILES.
+//
+// IndexedDB is per-browser AND per profile (even two Chromas don't
+// share it), so a preset saved in one place can't be seen in
+// another. Export serializes selected/all presets - sphere state
+// plus every stored image re-encoded to base64 - into one JSON the
+// user keeps next to the project; Import restores it into whatever
+// browser opens it. Same name on import = overwrite.
+// ------------------------------------------------------------
+
+function fileToB64(file) {
+
+    return new Promise((resolve, reject) => {
+
+        const fr =
+            new FileReader();
+
+        fr.onload = () =>
+            resolve(String(fr.result).split(',')[1]);
+
+        fr.onerror = () => reject(fr.error);
+
+        fr.readAsDataURL(file);
+    });
+}
+
+async function exportPresetFile() {
+
+    const sel = document.getElementById('presetSelect');
+
+    if (!sel || sel.options.length === 0) {
+
+        presetMsg('Nothing to export - no presets saved yet.', true);
+        return;
+    }
+
+    // '*' = every preset, otherwise just the selected one
+    const selectedKey =
+        sel.value && sel.value !== '*' ? sel.value : null;
+
+    const btn = document.getElementById('presetExportBtn');
+    if (btn) btn.disabled = true;
+
+    try {
+
+        presetMsg('Exporting (re-encoding images)...');
+
+        const list = presetIndex();
+
+        const picked = selectedKey
+            ? list.filter(e => e.key === selectedKey)
+            : list;
+
+        if (picked.length === 0) {
+
+            presetMsg('That preset is missing from storage.', true);
+            return;
+        }
+
+        const out = [];
+
+        for (const entry of picked) {
+
+            const state = await presetDbGet(entry.key);
+
+            if (!state) continue;
+
+            const blobs = [];
+
+            for (const f of state.blobs || []) {
+
+                blobs.push({
+                    name: f.name || 'image',
+                    type: f.type || 'application/octet-stream',
+                    size: f.size,
+                    b64: await fileToB64(f)
+                });
+            }
+
+            out.push({
+                name: entry.name,
+                savedAt: entry.savedAt,
+                spheres: state.spheres,
+                blobs
+            });
+        }
+
+        const json = JSON.stringify({ presetExport: 1, presets: out });
+
+        const a = document.createElement('a');
+
+        a.href = URL.createObjectURL(
+            new Blob([json], { type: 'application/json' })
+        );
+
+        a.download =
+            selectedKey
+                ? `${picked[0].name.replace(/[^\w-]+/g, '_')}.json`
+                : 'sphere_presets.json';
+
+        a.click();
+
+        URL.revokeObjectURL(a.href);
+
+        presetMsg(
+            `Exported ${out.length} preset(s) to ${a.download}.`
+        );
+
+    } catch (err) {
+
+        console.error('preset export failed:', err);
+        presetMsg(`Export failed: ${err.message}`, true);
+
+    } finally {
+
+        if (btn) btn.disabled = false;
+    }
+}
+
+async function importPresetFile(file) {
+
+    presetMsg('Importing...');
+
+    try {
+
+        const data =
+            JSON.parse(await file.text());
+
+        if (data.presetExport !== 1 || !Array.isArray(data.presets)) {
+            throw new Error('not a sphere preset export file');
+        }
+
+        const list = presetIndex();
+
+        let imported = 0;
+
+        for (const p of data.presets) {
+
+            if (!Array.isArray(p.spheres)) continue;
+
+            // rebuild the File objects from base64
+            const blobs = [];
+
+            for (const b of p.blobs || []) {
+
+                const resp =
+                    await fetch(
+                        `data:${b.type || 'image/png'};base64,${b.b64}`
+                    );
+
+                blobs.push(
+                    new File([await resp.blob()], b.name, { type: b.type })
+                );
+            }
+
+            const key = 'p' + Date.now() + 'i' + imported;
+
+            await presetDbPut(key, {
+                version: 1,
+                spheres: p.spheres,
+                blobs
+            });
+
+            const dup = list.find(e => e.name === p.name);
+
+            if (dup) {
+
+                await presetDbDelete(dup.key);
+                dup.key = key;
+                dup.count = p.spheres.length;
+                dup.savedAt = p.savedAt || Date.now();
+
+            } else {
+
+                list.push({
+                    key,
+                    name: p.name,
+                    count: p.spheres.length,
+                    savedAt: p.savedAt || Date.now()
+                });
+            }
+
+            imported++;
+        }
+
+        presetIndexSave(list);
+        presetUiRefresh();
+
+        presetMsg(
+            `Imported ${imported} preset(s) from ${file.name}.`
+        );
+
+    } catch (err) {
+
+        console.error('preset import failed:', err);
+        presetMsg(`Import failed: ${err.message}`, true);
+    }
+}
+
+const presetImportInput =
+    document.getElementById('presetImportFile');
+
+if (presetImportInput) {
+
+    presetImportInput.addEventListener('change', (e) => {
+
+        const file = e.target.files[0];
+
+        if (file) {
+            importPresetFile(file);
+        }
+
+        e.target.value = '';
+    });
+}
+
+if (presetSaveBtn) {
+
+    presetSaveBtn.addEventListener('click', savePreset);
+
+    document.getElementById('presetLoadBtn')
+        .addEventListener('click', loadPreset);
+
+    document.getElementById('presetDeleteBtn')
+        .addEventListener('click', deletePreset);
+
+    document.getElementById('presetExportBtn')
+        .addEventListener('click', exportPresetFile);
+
+    document.getElementById('presetImportBtn')
+        .addEventListener('click', () => {
+
+            if (presetImportInput) {
+                presetImportInput.click();
+            }
+        });
+}
+
+presetUiRefresh();
+
 // Sphere Field mode - full-screen surface with many independent
 // spheres (see sphere-field.js). Clicking a sphere selects it; the
 // sidebar's spin/glow/scale/etc controls then drive THAT sphere
@@ -5396,6 +5999,36 @@ onSelectionChanged((sphere) => {
         input.checked =
             parseInt(input.value, 10) === effectiveFaceCount;
     });
+
+    // If the newly selected sphere carries typed text (slot 0 came
+    // from the Text Message box), put that exact string back in the
+    // box. Without this, the box keeps whatever the LAST sphere's
+    // text (or the page-load default 'HELLO WORLD!') was, and
+    // choosing Text Message while this sphere is selected would
+    // re-upload that stale/default string OVER the sphere's real
+    // text. Setting .value directly fires no 'input' event, so this
+    // restore cannot itself trigger an upload.
+    if (customTextInput) {
+
+        const sphereText =
+            sphere && sphere.textSources && sphere.textSources[0];
+
+        if (sphereText != null) {
+
+            // A text sphere restores its exact words for editing.
+            customTextInput.value = sphereText;
+
+        } else {
+
+            // Image sphere / no selection: clear rather than leave a
+            // stale string from the last text sphere - leftover text
+            // + a click on Text Message would silently bake the wrong
+            // words onto this sphere. Empty + placeholder prompts the
+            // user to type; picking Text Message with an empty box
+            // asks before applying anything (see resolveTypedText).
+            customTextInput.value = '';
+        }
+    }
 
     // The per-face thumbnails need to reflect whichever sphere (or
     // the main globe) is now targeted, not whatever was selected

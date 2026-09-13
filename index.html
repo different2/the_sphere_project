@@ -129,9 +129,29 @@
 
             <div class="control-group export-group">
                 <button type="button" id="sphereFieldBtn">Spawn a Sphere</button>
-                <button type="button" id="exportGifBtn">Export Loopable GIF</button>
-                <button type="button" id="exportWebmBtn">Export Video (WebM)</button>
+                <div class="export-buttons">
+                    <button type="button" id="exportGifBtn" title="Export Loopable GIF">GIF</button>
+                    <button type="button" id="exportWebmBtn" title="Export Video (WebM)">Video</button>
+                </div>
                 <div id="exportStatus" class="export-status"></div>
+            </div>
+
+            <div class="control-group preset-group" title="Saves every spawned sphere - positions, sizes, spin and uploaded images/GIFs - to reload and keep editing later. Saved fields live in THIS browser; Export/Import move them between browsers or keep file backups.">
+                <div class="preset-row">
+                    <label for="presetSelect">Fields:</label>
+                    <select id="presetSelect">
+                        <option value="">(none saved yet)</option>
+                    </select>
+                </div>
+                <div class="preset-buttons">
+                    <button type="button" id="presetSaveBtn" title="Save the whole current field as a new preset">Save</button>
+                    <button type="button" id="presetLoadBtn" title="Load the selected preset">Load</button>
+                    <button type="button" id="presetDeleteBtn" title="Delete the selected preset">Delete</button>
+                    <button type="button" id="presetExportBtn" title="Download presets as a .json file (images included) - portable between browsers">Export</button>
+                    <button type="button" id="presetImportBtn" title="Import presets from an exported .json file">Import</button>
+                    <input type="file" id="presetImportFile" accept=".json,application/json" style="display: none;">
+                </div>
+                <div id="presetStatus" class="upload-status"></div>
             </div>
 
             <!-- Shown only while Sphere Field mode is active and a sphere

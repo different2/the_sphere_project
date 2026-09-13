@@ -353,8 +353,29 @@ function createFieldSphere(x, y, size) {
         // a single composite texture by regenerateFieldSphereTexture
         // whenever a face's image changes or faceCount changes.
         faceImages: {},
+        // Raw File bytes behind each face slot (keyed like
+        // faceImages). The <img> sources above become useless after
+        // a page reload (their blob: object URLs are revoked), but
+        // field presets must survive reloads - so every upload also
+        // keeps its original File here, and preset save serializes
+        // THESE back into storage. See serializeFieldState().
+        sourceFiles: {},
+        // For the slot-0 image that came from the typed-text box:
+        // the literal string it was rendered from, so selecting a
+        // text sphere + Text Message puts the words back in the box
+        // for editing instead of resetting it to the default.
+        // Cleared by any other primary upload.
+        textSources: {},
         faceCount: 1
     };
+}
+
+// Remember (or clear) the literal string a slot-0 image was typed
+// from. Called by main.js right after a successful typed-text upload;
+// any OTHER slot-0 upload clears it via the setFaceImage/GIF reset.
+function setSphereTextSource(sphere, text) {
+
+    sphere.textSources = text == null ? {} : { 0: text };
 }
 
 // The sphere's square: CSS box (hit-testing, marker placement) and
@@ -961,6 +982,8 @@ function setFaceImage(sphere, faceIndex, source) {
 
     if (faceIndex === 0) {
         sphere.faceImages = {};
+        sphere.sourceFiles = {};
+        sphere.textSources = {};
         disposeFieldSphereFrames(sphere);
     }
 
@@ -1145,6 +1168,11 @@ export async function loadFileOntoFieldSphere(sphere, file, faceIndex = 0) {
 
                 pctx.drawImage(patch, f.dims.left, f.dims.top);
 
+                // Remember the original File too - a loaded preset's
+                // spheres must stay editable/re-savable (see
+                // sourceFiles in createFieldSphere).
+                sphere.sourceFiles[faceIndex] = file;
+
                 setFaceImage(sphere, faceIndex, persistent);
 
                 return;
@@ -1249,6 +1277,8 @@ export async function loadFileOntoFieldSphere(sphere, file, faceIndex = 0) {
             // A new primary image (GIF or static) starts over -
             // matches main.js's applyCustomImage rule for slot 0.
             sphere.faceImages = {};
+            sphere.sourceFiles = {};
+            sphere.textSources = {};
 
             if (sphere.texture) {
                 gl.deleteTexture(sphere.texture);
@@ -1261,6 +1291,8 @@ export async function loadFileOntoFieldSphere(sphere, file, faceIndex = 0) {
                 texture: uploadTex(b.canvas),
                 delay: b.delay
             }));
+
+            sphere.sourceFiles[0] = file;
 
             sphere.frameIndex = 0;
             sphere.elapsedMs = 0;
@@ -1285,7 +1317,12 @@ export async function loadFileOntoFieldSphere(sphere, file, faceIndex = 0) {
             // setFaceImage() already renders (via
             // regenerateFieldSphereTexture), so there's nothing left
             // to do here after it but release the object URL.
+            // sourceFiles is written AFTER setFaceImage because a
+            // slot-0 upload CLEARS the map (new-primary rule) -
+            // writing first would be wiped.
             setFaceImage(sphere, faceIndex, img);
+
+            sphere.sourceFiles[faceIndex] = file;
 
             URL.revokeObjectURL(url);
         }
@@ -1561,6 +1598,122 @@ function spawnMany(n, size = 160) {
     return made;
 }
 
+// ------------------------------------------------------------
+// Preset save/load (bridge used by main.js's Presets UI; bytes
+// live in IndexedDB there).
+//
+// serializeFieldState(): snapshot of every sphere plus the image
+// File objects in a parallel `blobs` array (IndexedDB stores File
+// objects natively, so the whole returned object goes in as one
+// record). sourceFiles is what makes this possible - the
+// <img>/<canvas> sources alone can't survive a reload (their blob:
+// URLs die with the page).
+//
+// loadFieldState(state): clears the field and rebuilds every sphere,
+// re-running each stored File through the normal upload path (so
+// GIFs re-animate, composites re-bake, and everything stays fully
+// editable - re-saving a loaded preset works unchanged).
+// ------------------------------------------------------------
+function serializeFieldState() {
+
+    const blobs = [];
+
+    const spheres = fieldSpheres.map(s => {
+
+        const faceSlots = {};
+
+        for (const [slot, file] of Object.entries(s.sourceFiles || {})) {
+
+            if (file) {
+                blobs.push(file);
+                faceSlots[slot] = blobs.length - 1;
+            }
+        }
+
+        return {
+            baseSize: s.baseSize,
+            centerX: s.centerX,
+            centerY: s.centerY,
+            phi: s.phi,
+            theta: s.theta,
+            faceCount: s.faceCount,
+            controls: s.controls,
+            faceSlots,
+            textSources: s.textSources || {}
+        };
+    });
+
+    return { version: 1, spheres, blobs };
+}
+
+async function loadFieldState(state) {
+
+    if (!state || state.version !== 1 || !Array.isArray(state.spheres)) {
+        throw new Error('not a sphere-field preset');
+    }
+
+    ensureFieldCanvas();
+    openSphereField();
+
+    for (const s of [...fieldSpheres]) {
+        deleteSphere(s);
+    }
+
+    let loadedCount = 0;
+
+    for (const rec of state.spheres) {
+
+        const s = createFieldSphere(
+            rec.centerX,
+            rec.centerY,
+            rec.baseSize || 160
+        );
+
+        s.faceCount = rec.faceCount || 1;
+        s.phi = rec.phi ?? s.phi;
+        s.theta = rec.theta ?? s.theta;
+        Object.assign(s.controls, rec.controls || {});
+
+        fieldSpheres.push(s);
+
+        // Re-run every stored File through the real upload path.
+        const slots = Object.entries(rec.faceSlots || {})
+            .sort((a, b) => Number(a[0]) - Number(b[0]));
+
+        for (const [slot, blobIdx] of slots) {
+
+            const file = state.blobs[blobIdx];
+
+            if (!file) {
+
+                console.warn(
+                    `preset: sphere ${s.id} slot ${slot}: file missing in storage, skipped`
+                );
+
+                continue;
+            }
+
+            await loadFileOntoFieldSphere(s, file, Number(slot));
+            loadedCount++;
+        }
+
+        // ...and ONLY then restore the typed-text strings: a slot-0
+        // upload clears textSources (new-primary rule), so applying
+        // the stored text before re-uploading would wipe it again.
+        s.textSources = rec.textSources || {};
+    }
+
+    renderField();
+
+    console.log(
+        `field preset loaded: ${fieldSpheres.length} spheres, ${loadedCount} images`
+    );
+
+    selectSphere(null);
+
+    return fieldSpheres.length;
+}
+
 export function clearFieldSpheres() {
 
     for (const s of [...fieldSpheres]) {
@@ -1575,6 +1728,8 @@ export {
     onSelectionChanged,
     setMoveMode,
     isMoveMode,
+    serializeFieldState,
+    loadFieldState,
     setSphereDots,
     setSphereScale,
     setSphereGlowColor,
@@ -1587,7 +1742,8 @@ export {
     setSphereTheta,
     setSphereUseDots,
     setSphereFaceCount,
-    getSphereControls
+    getSphereControls,
+    setSphereTextSource
 };
 
 // Escape: deselect a sphere if one is selected, otherwise close the

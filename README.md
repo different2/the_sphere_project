@@ -140,6 +140,23 @@ texture or as a Fibonacci-lattice dot pattern.
 ## Project structure
 
 - `index.html`, `styles.css` - page and UI.
+- **Field PRESETS (Sept 2026):** sidebar "Saved fields" group saves the
+  whole spawned-sphere field - every sphere's position, size, spin,
+  faces, glow, AND its uploaded images/GIFs/typed-text (the original
+  file bytes are recorded on every upload via `sphere.sourceFiles`, so
+  typed text is stored BOTH as its baked PNG and its literal string, so selecting the sphere puts the words back in the Text Message box for editing) - into IndexedDB
+  under a name; Load rebuilds the field by re-running each stored
+  image through the normal upload path, so loaded spheres stay fully
+  editable and a same-named save overwrites the preset instead of
+  duplicating. IMPORTANT: IndexedDB is per-browser AND per Chrome
+  profile (even two Chromas don't share it, and localhost port
+  changes count as different sites) - so **Export to file / Import
+  file** buttons turn presets into portable `.json` files
+  (`{ presetExport: 1, presets: [...] }`, images base64'd inside) to
+  move them between browsers/profiles or back them up next to the
+  project. `saved_presets_backup.json` (gitignored) holds the presets
+  made during the rewrite testing (incl. one named "testing") -
+  Import it once in your own browser and they're yours.
 - `server.py` - dev server (replaces `python3 -m http.server`): same
   static serving PLUS a `/_assets-list` endpoint, which powers the
   Texture dropdown's auto-populated "Assets folder" group - drop any
